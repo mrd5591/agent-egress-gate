@@ -18,7 +18,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/egressgate ./cmd/e
 # The gate reads its policy from a file or from the environment and writes its
 # audit log to stdout, so it needs nothing writable. The task definition runs
 # it with a read-only root filesystem.
-FROM alpine:3.20
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -g 65532 -S gate \
