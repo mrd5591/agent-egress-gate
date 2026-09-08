@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 
@@ -64,13 +65,31 @@ func (g *gate) auditRecords(t *testing.T) []audit.Record {
 }
 
 // lastAuditRecord is the common case: one request, one record.
+//
+// It waits, because a tunnel's record is written when the tunnel closes, not
+// when it opens. A client that has finished reading a response may still hold
+// the tunnel open for reuse, so the record can lag the response by a moment.
 func (g *gate) lastAuditRecord(t *testing.T) audit.Record {
 	t.Helper()
-	recs := g.auditRecords(t)
-	if len(recs) == 0 {
-		t.Fatal("no audit records written")
-	}
+	recs := g.waitForAuditRecords(t, 1)
 	return recs[len(recs)-1]
+}
+
+// waitForAuditRecords polls until at least n records exist or the test's
+// patience runs out.
+func (g *gate) waitForAuditRecords(t *testing.T, n int) []audit.Record {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		recs := g.auditRecords(t)
+		if len(recs) >= n {
+			return recs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waited for %d audit records, only %d were written", n, len(recs))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // hostRule builds a policy allowing exactly the host and port of rawURL, with

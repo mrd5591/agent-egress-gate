@@ -129,8 +129,12 @@ func removeHopByHop(h http.Header) {
 	}
 }
 
-// ServeHTTP handles a proxied request.
+// ServeHTTP dispatches to the tunnel or the plain-HTTP path.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		h.handleConnect(w, r)
+		return
+	}
 	h.handleHTTP(w, r)
 }
 
