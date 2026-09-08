@@ -1,0 +1,32 @@
+# Dependency updates arrive on the calendar, not on your commit schedule.
+#
+# This exists because a scheduled scan found spring-web pinned seven patches
+# behind the END of a line that was no longer maintained, and nothing had
+# surfaced it. A weekly scan reports that state; this proposes the fix.
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+
+  # The base images are the two inputs that actually ship, and the only ones
+  # that were not pinned while every build tool was.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+  # The actions in a workflow are dependencies too, and the least-watched ones.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
