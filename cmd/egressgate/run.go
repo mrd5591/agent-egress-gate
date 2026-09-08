@@ -469,9 +469,17 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 }
 
 // requestFor turns a URL into the question the proxy would ask. An https URL
-// becomes a CONNECT with no method or path, because that is exactly what the
-// gate will see. Modelling it any other way would let check report an allow
-// the running gate then refuses.
+// becomes a CONNECT with no method or path, because that is what the gate sees
+// from any ordinary client. Modelling it another way would let check report an
+// allow the running gate then refuses.
+//
+// The approximation errs on the conservative side, and that is not free. A
+// client sending an https URL in absolute form straight to the data port takes
+// the plain-HTTP path, where method and path are visible and therefore
+// enforceable, and can be allowed where check said deny. No proxy-configured
+// client does that. The guarantee check offers is one-directional: it never
+// promises an allow the gate would refuse, but it may refuse one the gate
+// would allow.
 func requestFor(u *url.URL, method string) policy.Request {
 	host := u.Hostname()
 	port := 80

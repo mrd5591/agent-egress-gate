@@ -45,13 +45,19 @@ type Config struct {
 	// ResponseHeaderTimeout bounds how long an upstream may take to send
 	// response headers after the request is written.
 	ResponseHeaderTimeout time.Duration
-	// IdleTimeout closes a CONNECT tunnel that has moved no bytes for this
-	// long. It is an idle timeout, not a lifetime cap, so a long-running but
-	// active download is not killed.
+	// IdleTimeout closes a CONNECT tunnel in which neither direction has moved
+	// bytes for this long. It is an idle timeout on the tunnel as a whole, not
+	// a lifetime cap and not a per-direction one, so a long download whose
+	// client has nothing to say is not killed.
 	IdleTimeout time.Duration
 	// MaxTunnelBytes caps each direction of a CONNECT tunnel independently.
-	// Zero means no cap. The client-to-upstream direction is the one that
-	// bounds how much a compromised agent can send out in a single tunnel.
+	// Zero means no cap.
+	//
+	// This is a resource guard, not an exfiltration control, and the
+	// difference matters. It applies only to tunnels: the plain-HTTP path
+	// enforces no cap in either direction, so an agent allowed one host over
+	// HTTP can still POST without bound. Read it as "one tunnel cannot consume
+	// the gate", not as "an agent cannot send more than this out".
 	MaxTunnelBytes int64
 }
 
