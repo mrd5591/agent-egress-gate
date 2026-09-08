@@ -88,6 +88,37 @@ func TestHashIsStableForAKnownRecord(t *testing.T) {
 	}
 }
 
+// encoding/json escapes <, > and & even inside strings. That is invisible
+// here because the same package writes and verifies, but it is exactly what
+// an independent verifier in another language would get wrong, so the
+// behaviour is pinned rather than left to be rediscovered.
+func TestChainSurvivesHTMLSignificantCharacters(t *testing.T) {
+	var buf bytes.Buffer
+	l := newTestLog(&buf)
+
+	if _, err := l.Append(Record{
+		Kind:     "http",
+		Host:     "a&b.example.com",
+		Port:     443,
+		Decision: "deny",
+		Reason:   "blocked <script> & such",
+	}); err != nil {
+		t.Fatalf("Append() error = %v", err)
+	}
+
+	if !strings.Contains(buf.String(), `\u0026`) {
+		t.Errorf("expected encoding/json to escape the ampersand; line was:\n%s", buf.String())
+	}
+
+	res, err := Verify(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if !res.OK {
+		t.Errorf("chain broke on escaped characters: %q at %d", res.Problem, res.BreakAt)
+	}
+}
+
 func TestOneRecordPerLine(t *testing.T) {
 	var buf bytes.Buffer
 	l := newTestLog(&buf)

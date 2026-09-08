@@ -126,6 +126,14 @@ func (l *Log) Head() (string, uint64) {
 // chainHash computes SHA-256 over the previous hash followed by the JSON
 // encoding of the record with an empty Hash field.
 //
+// The hashed bytes are exactly what encoding/json produces, and it escapes
+// the three HTML-significant characters: < becomes \u003c, > becomes
+// \u003e, and & becomes \u0026. Writer and verifier both use this package,
+// so the chain is self-consistent. Anyone reimplementing the verifier in
+// another language must reproduce that escaping, or every record whose host
+// or reason contains one of those characters will fail to verify; Python's
+// json.dumps, for one, does not escape them by default.
+//
 // The marshalling error is unreachable today: Record holds only strings and
 // integers, and encoding/json fails only on channels, functions, complex
 // numbers, cyclic structures and invalid floats. It is handled rather than

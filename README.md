@@ -122,7 +122,7 @@ chain BROKEN at record 2: record hash eebe75… does not match the recomputed ha
 1 records verified before the break
 ```
 
-Two honest limits:
+Three honest limits:
 
 - This is tamper **evidence**, not tamper resistance. Someone who can rewrite
   the whole file can rebuild a consistent chain. `serve` prints the chain head
@@ -131,6 +131,10 @@ Two honest limits:
 - A tunnel's record is written when the tunnel **closes**, because the byte
   counts are not known before then. While a long tunnel is open it is absent
   from the log. Watch `egressgate_active_tunnels` for that window.
+- The hashed bytes are Go's `encoding/json` output, which escapes `<`, `>` and
+  `&` as `\u003c`, `\u003e` and `\u0026`. Writer and verifier agree, so this is
+  invisible in normal use, but a verifier reimplemented in another language
+  has to reproduce that escaping. Python's `json.dumps` does not, by default.
 
 ## Running it
 
