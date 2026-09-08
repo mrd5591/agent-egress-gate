@@ -216,7 +216,7 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "egressgate: upstream request failed", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	removeHopByHop(resp.Header)
 	for name, values := range resp.Header {

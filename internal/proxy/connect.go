@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -80,7 +81,7 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "egressgate: could not reach upstream", http.StatusBadGateway)
 		return
 	}
-	defer upstream.Close()
+	defer func() { _ = upstream.Close() }()
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
@@ -100,7 +101,7 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "egressgate: could not take over the connection", http.StatusInternalServerError)
 		return
 	}
-	defer clientConn.Close()
+	defer func() { _ = clientConn.Close() }()
 
 	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		rec.Reason = "client went away before the tunnel opened"
@@ -144,8 +145,8 @@ func (h *Handler) pump(clientConn net.Conn, buffered io.Reader, upstream net.Con
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
-			clientConn.Close()
-			upstream.Close()
+			_ = clientConn.Close()
+			_ = upstream.Close()
 		})
 	}
 
@@ -187,8 +188,10 @@ func splitAuthority(authority string) (host string, port int, err error) {
 	h, p, splitErr := net.SplitHostPort(authority)
 	if splitErr != nil {
 		// No colon at all means no port, which is legal and means 443.
-		// Anything else is malformed.
-		if addrErr, ok := splitErr.(*net.AddrError); ok && addrErr.Err == "missing port in address" {
+		// Anything else is malformed. errors.As rather than a type assertion,
+		// so a future wrapped error still matches.
+		var addrErr *net.AddrError
+		if errors.As(splitErr, &addrErr) && addrErr.Err == "missing port in address" {
 			return authority, 443, nil
 		}
 		return "", 0, fmt.Errorf("malformed CONNECT authority %q", authority)

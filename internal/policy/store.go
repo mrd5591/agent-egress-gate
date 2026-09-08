@@ -60,6 +60,10 @@ func (s *Store) Reload(path string) error {
 }
 
 func readPolicy(path string) (*Policy, error) {
+	// #nosec G304 -- reading an operator-chosen policy file is the entire
+	// purpose of this function. The path comes from a command-line flag set by
+	// whoever runs the gate, not from any proxied request, so there is no
+	// untrusted input to constrain here.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read policy: %w", err)

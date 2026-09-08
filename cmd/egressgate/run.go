@@ -114,12 +114,20 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 
 	auditWriter := io.Writer(stdout)
 	if *auditPath != "" {
+		// #nosec G304 -- the audit path is an operator-supplied flag, not
+		// anything a proxied request can influence.
 		f, err := os.OpenFile(*auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			fmt.Fprintf(stderr, "egressgate: opening audit log: %v\n", err)
 			return exitFail
 		}
-		defer f.Close()
+		// A failed close on the audit log can mean records never reached the
+		// disk, so it is reported rather than discarded.
+		defer func() {
+			if cerr := f.Close(); cerr != nil {
+				fmt.Fprintf(stderr, "egressgate: closing audit log: %v\n", cerr)
+			}
+		}()
 		auditWriter = f
 	}
 	auditLog := audit.New(auditWriter)
@@ -141,14 +149,17 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 	// Listeners are opened before either server starts so that a port
 	// conflict is reported as a startup failure, and so that binding to port
 	// 0 can be announced with the port actually chosen.
-	dataLn, err := net.Listen("tcp", *listenAddr)
+	lc := &net.ListenConfig{}
+	listenCtx := context.Background()
+
+	dataLn, err := lc.Listen(listenCtx, "tcp", *listenAddr)
 	if err != nil {
 		fmt.Fprintf(stderr, "egressgate: listening on %s: %v\n", *listenAddr, err)
 		return exitFail
 	}
-	adminLn, err := net.Listen("tcp", *adminAddr)
+	adminLn, err := lc.Listen(listenCtx, "tcp", *adminAddr)
 	if err != nil {
-		dataLn.Close()
+		_ = dataLn.Close()
 		fmt.Fprintf(stderr, "egressgate: listening on %s: %v\n", *adminAddr, err)
 		return exitFail
 	}
@@ -220,12 +231,13 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
+	// #nosec G304 -- the audit path is an operator-supplied flag.
 	f, err := os.Open(*auditPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "egressgate: %v\n", err)
 		return exitFail
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	res, err := audit.Verify(f)
 	if err != nil {
