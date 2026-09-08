@@ -175,6 +175,11 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
+  # Each task writes its own audit chain from sequence 1 into its own CloudWatch
+  # stream, because the audit log goes to stdout and there is no file to resume
+  # from. Two tasks therefore means two independently verifiable chains, not one
+  # interleaved and unverifiable log. See "What the chain means on ECS" in the
+  # README.
   description = "Number of gate tasks. More than one needs a load balancer in front."
   type        = number
   default     = 2

@@ -154,8 +154,10 @@ Some honest limits:
   the Terraform module opens the admin port to nothing by default: until you
   pass `admin_ingress_security_group_ids`, no collector can scrape it and the
   window is genuinely unobserved.
-- A restart continues the existing chain rather than starting a new one, so a
-  deploy does not look like tampering. If a previous run was killed mid-write,
+- **With `--audit <file>`,** a restart continues the existing chain rather than
+  starting a new one, so a deploy does not look like tampering. This is the one
+  bullet here that does not hold in the deployed configuration, which has no
+  file to read back — see "What the chain means on ECS" below. If a previous run was killed mid-write,
   the gate discards the partial final record, says so on stderr, and resumes
   from the last complete one. That case is deliberately distinguished from a
   real break: refusing to start on a torn write would turn one crash into a
@@ -322,6 +324,47 @@ started no container at all. The `container` CI job now runs the image the way
 the task definition does and drives real traffic through it, which is what
 actually covers that block. The rest remains a reviewed starting point, not
 something known to converge on the first apply.
+
+### What the chain means on ECS
+
+The bullets above describe a gate whose audit log is a file. The task definition
+does not run it that way: records go to stdout so they land in CloudWatch, which
+is the one place the task itself cannot rewrite. That is the right call for
+evidence, and it has a consequence worth stating rather than leaving to be
+discovered.
+
+**There is no file to read back, so `Resume` never runs, and each task instance
+writes its own chain starting at sequence 1.** A restart does not continue the
+previous chain — it begins a new one. `desired_count` defaults to 2, so a normal
+deployment is running two chains at once.
+
+They do not interleave. `awslogs-stream-prefix = "gate"` puts each task in its
+own CloudWatch stream, so every stream is a complete chain covering exactly one
+task's lifetime, and `verify` reads any one of them as-is.
+
+What that buys, precisely:
+
+| | Holds? |
+|---|---|
+| A record altered within one task's lifetime | detected |
+| Records removed from the middle of a stream | detected |
+| The tail of a stream truncated | detected **only** if you recorded that chain's head |
+| A whole stream deleted | not detected by `verify` — that is the log group's retention and IAM story |
+| Linkage between a task and the task that replaced it | **none** |
+
+`serve` prints the chain head on shutdown for the third row: record it somewhere
+the gate cannot write, and a truncated tail becomes detectable. Nothing links
+consecutive tasks, so a gate that was killed and replaced leaves two unrelated
+chains.
+
+**Cross-restart continuity is deliberately not built.** Threading the head
+through SSM or a sidecar so a new task could resume its predecessor's chain is a
+larger and more failure-prone product than the gate itself, and it would put a
+write dependency on the start-up path of the thing whose job is to not be
+bypassable. Per-task chains plus a recorded head cover the same ground for the
+threat this gate is built against — an agent, or something it installed,
+reaching a host nobody vetted. An adversary who can terminate ECS tasks is
+already outside the boundary described in the threat model.
 
 ## Building the container
 
