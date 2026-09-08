@@ -71,16 +71,43 @@ func TestAppendChainsHashes(t *testing.T) {
 // The chain is only useful if the hash is reproducible from the record alone.
 // Pinning one value catches a field reordering or a marshalling change that
 // would otherwise silently invalidate every previously written log.
+//
+// Every field is populated, and that is the point rather than thoroughness for
+// its own sake. An omitempty field left at its zero value emits no key at all,
+// so a pin built from a sparse record cannot see two absent fields swap
+// places: it stays green while the hash of every real record carrying those
+// fields changes. Half of Record is omitempty, so half the reordering this
+// test claims to prevent used to be invisible to it.
+//
+// The host, path and reason carry &, < and > on purpose: they pin the escaped
+// forms encoding/json emits for those three characters, which is the one
+// detail a verifier reimplemented in another language gets wrong by default.
 func TestHashIsStableForAKnownRecord(t *testing.T) {
 	var buf bytes.Buffer
 	l := newTestLog(&buf)
-	r, err := l.Append(Record{Kind: "http", Host: "a.com", Port: 443, Decision: "allow", Rule: "r"})
+	r, err := l.Append(Record{
+		Kind:       "connect",
+		Method:     "GET",
+		Host:       "a&b.example.com",
+		Port:       8443,
+		Path:       "/repos/<owner>/x",
+		Decision:   "deny",
+		Rule:       "rule-1",
+		Reason:     "blocked <script> & such",
+		Client:     "127.0.0.1:5555",
+		Status:     403,
+		BytesUp:    841,
+		BytesDown:  5324,
+		DurationMS: 180,
+	})
 	if err != nil {
 		t.Fatalf("Append() error = %v", err)
 	}
-	// Cross-checked against an independent SHA-256 implementation rather than
-	// copied from this package's own output.
-	const want = "5beffb94d4a5036f45f5299a4f9e6fdf6de718ff69fbe8e27460776cdf62c19e"
+	// Derived independently: the pre-image was written out by hand from the
+	// field order above and hashed with a SHA-256 implementation outside Go,
+	// rather than copied from this package's own output, which would only
+	// prove the package agrees with itself.
+	const want = "10c3c8232c39eb1e337888b7516101746b4da1adf9e36a55b05aff5154e20965"
 	if r.Hash != want {
 		t.Errorf("Hash = %q, want %q\n"+
 			"If this changed deliberately, every existing audit log is now unverifiable; "+
@@ -367,4 +394,136 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.w.Write(p)
+}
+
+// The chain covers a record's fields, not the bytes of the line it sits on,
+// so anything the line can hold beside the record is a place to hide things.
+// DisallowUnknownFields closes that for extra keys inside the object; a second
+// JSON value concatenated after it is the same hole one step over. Decoding
+// one value and stopping would leave a forged record sitting in the file,
+// readable by anything that walks the line as a JSON stream, and invisible to
+// the verifier that is supposed to be the last word on the file's contents.
+func TestVerifyRejectsASecondRecordSplicedOntoALine(t *testing.T) {
+	var buf bytes.Buffer
+	l := newTestLog(&buf)
+	for _, host := range []string{"a.com", "b.com", "c.com"} {
+		if _, err := l.Append(Record{Kind: "http", Host: host, Port: 443, Decision: "deny"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	forged, err := json.Marshal(Record{
+		Seq: 4, TS: "2026-09-08T14:02:11Z", Kind: "connect",
+		Host: "exfil.attacker.test", Port: 443, Decision: "allow",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	lines[2] += string(forged)
+	spliced := strings.Join(lines, "\n") + "\n"
+
+	// The premise, asserted rather than assumed: that line really does carry
+	// two records to any reader that does not stop after the first.
+	dec := json.NewDecoder(strings.NewReader(lines[2]))
+	var first, second Record
+	if err := dec.Decode(&first); err != nil {
+		t.Fatalf("test setup: first value does not decode: %v", err)
+	}
+	if err := dec.Decode(&second); err != nil {
+		t.Fatalf("test setup: second value does not decode: %v", err)
+	}
+	if second.Host != "exfil.attacker.test" {
+		t.Fatalf("test setup: second value is %+v", second)
+	}
+
+	res, err := Verify(strings.NewReader(spliced))
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if res.OK {
+		t.Fatal("OK = true with a forged record spliced onto an audited line")
+	}
+	if res.BreakAt != 3 {
+		t.Errorf("BreakAt = %d, want 3 (the line the extra bytes are on)", res.BreakAt)
+	}
+	if !strings.Contains(res.Problem, "trailing") {
+		t.Errorf("Problem = %q, want it to name the trailing bytes", res.Problem)
+	}
+}
+
+// The prev link is what makes the chain a chain, and it needs a test of its
+// own because the hash check normally fires first and hides its absence. This
+// record's hash is computed over the real previous head, so the recomputed
+// hash matches and only the prev field lies. Without the prev check the log
+// verifies while claiming a history it does not have, which is exactly what an
+// offline reader following prev links would be misled by.
+func TestVerifyRejectsARecordWhosePrevLinkLies(t *testing.T) {
+	var buf bytes.Buffer
+	l := newTestLog(&buf)
+	r1, err := l.Append(Record{Kind: "http", Host: "a.com", Port: 443, Decision: "allow"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Append(Record{Kind: "http", Host: "b.com", Port: 443, Decision: "allow"}); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	var rec Record
+	if err := json.Unmarshal([]byte(lines[1]), &rec); err != nil {
+		t.Fatal(err)
+	}
+	rec.Prev = strings.Repeat("ab", 32) // a head no record in this log ever had
+	// Hashed against the true predecessor, so the hash check cannot save us.
+	h, err := chainHash(r1.Hash, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.Hash = h
+	forged, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Verify(strings.NewReader(lines[0] + "\n" + string(forged) + "\n"))
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if res.OK {
+		t.Fatal("OK = true for a record whose prev names a hash no record has")
+	}
+	if res.BreakAt != 2 {
+		t.Errorf("BreakAt = %d, want 2", res.BreakAt)
+	}
+	if !strings.Contains(res.Problem, "prev") {
+		t.Errorf("Problem = %q, want it to name the prev link", res.Problem)
+	}
+}
+
+// An unknown key changes no field the hash covers, so the chain still
+// verifies over it. Rejecting the line is the only thing that stops the log's
+// own format being a place to stash bytes.
+func TestVerifyRejectsAnUnknownFieldSplicedIntoARecord(t *testing.T) {
+	var buf bytes.Buffer
+	l := newTestLog(&buf)
+	if _, err := l.Append(Record{Kind: "http", Host: "a.com", Port: 443, Decision: "allow"}); err != nil {
+		t.Fatal(err)
+	}
+
+	spliced := strings.Replace(buf.String(), `{"seq":1,`, `{"seq":1,"note":"anything at all",`, 1)
+	if !strings.Contains(spliced, "anything at all") {
+		t.Fatal("test setup failed to splice the extra key")
+	}
+
+	res, err := Verify(strings.NewReader(spliced))
+	if err != nil {
+		t.Fatalf("Verify() error = %v", err)
+	}
+	if res.OK {
+		t.Fatal("OK = true for a record carrying a key the format does not define")
+	}
+	if !strings.Contains(res.Problem, "decode") {
+		t.Errorf("Problem = %q, want it to report the failed decode", res.Problem)
+	}
 }

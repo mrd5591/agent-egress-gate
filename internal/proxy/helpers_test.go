@@ -3,11 +3,13 @@ package proxy
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,4 +145,121 @@ func proxiedClient(t *testing.T, gateURL string) *http.Client {
 		t.Fatalf("url.Parse(%q) error = %v", gateURL, err)
 	}
 	return &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
+}
+
+// countingListener counts the connections a listener accepts, and reports the
+// peer address of each one.
+//
+// Accepts, not handler invocations. That distinction is the whole containment
+// claim: a gate that dialled an upstream and only then answered 403 opens a
+// real TCP connection to a host the policy forbade, and on the CONNECT path it
+// completes no TLS handshake and runs no handler at all. A test counting
+// handler calls stays green while the containment is gone, which is exactly
+// the weaker test the README warns about.
+type countingListener struct {
+	net.Listener
+	accepted atomic.Int64
+	// seen carries every accepted peer address. The send is non-blocking, so a
+	// listener built without a channel (or one whose buffer overflows) costs a
+	// dropped signal rather than a wedged accept loop.
+	seen chan net.Addr
+}
+
+func newCountingListener(t *testing.T) *countingListener {
+	t.Helper()
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listening for the upstream: %v", err)
+	}
+	l := &countingListener{Listener: base, seen: make(chan net.Addr, 64)}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+		select {
+		case l.seen <- c.RemoteAddr():
+		default:
+		}
+	}
+	return c, err
+}
+
+func (l *countingListener) count() int64 { return l.accepted.Load() }
+
+// addr is the authority a CONNECT request names, and url is the form the
+// policy helpers parse. Nothing here ever speaks TLS; the https scheme only
+// tells hostRule which port to pin.
+func (l *countingListener) addr() string  { return l.Addr().String() }
+func (l *countingListener) https() string { return "https://" + l.addr() }
+
+// serveNothing runs an accept loop that holds every connection open and reads
+// nothing from it. Something has to call Accept, or a connection the gate
+// should never have opened sits unnoticed in the kernel's backlog and is never
+// counted. Connections are tracked and closed together, because registering a
+// cleanup from inside the goroutine would race the end of the test.
+func serveNothing(t *testing.T, l *countingListener) {
+	t.Helper()
+	var mu sync.Mutex
+	var held []net.Conn
+	t.Cleanup(func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range held {
+			_ = c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+}
+
+// assertNoAccepts is the containment assertion: the upstream accepted nothing.
+//
+// It cannot simply read the counter. A connection the gate dialled has
+// completed its handshake and is sitting in the kernel's accept queue before
+// the dial returns, but the accept loop may not have counted it yet, so an
+// immediate read could pass on a gate that had already reached the host. So
+// the test opens a connection of its own and waits for that one to be
+// accepted. The accept queue is FIFO and the counter is incremented inside
+// Accept, so by the time our own connection surfaces, anything the gate queued
+// ahead of it has been counted. No sleeps and no timing margins: the only
+// clock here is the guard against hanging forever.
+func assertNoAccepts(t *testing.T, l *countingListener) {
+	t.Helper()
+
+	probe, err := net.Dial("tcp", l.addr())
+	if err != nil {
+		t.Fatalf("dialling the upstream to synchronise with its accept loop: %v", err)
+	}
+	defer func() { _ = probe.Close() }()
+	want := probe.LocalAddr().String()
+
+	var extra []string
+	for {
+		select {
+		case peer := <-l.seen:
+			if peer.String() == want {
+				if len(extra) != 0 {
+					t.Errorf("upstream accepted %d connection(s) on a denied request, want 0; peers: %v",
+						len(extra), extra)
+				}
+				return
+			}
+			extra = append(extra, peer.String())
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the upstream never accepted the probe connection (accepts so far: %d)", l.count())
+		}
+	}
 }

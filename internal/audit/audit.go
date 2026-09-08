@@ -29,8 +29,11 @@ const GenesisHash = "00000000000000000000000000000000000000000000000000000000000
 //
 // Field order is part of the hash input, because the chain hashes the JSON
 // encoding and Go marshals struct fields in declaration order. Reordering
-// these fields invalidates every previously written log; TestHashIsStable
-// pins one value so that cannot happen by accident.
+// these fields invalidates every previously written log;
+// TestHashIsStableForAKnownRecord pins one value so that cannot happen by
+// accident. Its record populates every field, including the omitempty ones,
+// because a field left at its zero value emits no key and so cannot be seen
+// to move.
 type Record struct {
 	Seq        uint64 `json:"seq"`
 	TS         string `json:"ts"`
@@ -175,6 +178,15 @@ type VerifyResult struct {
 	// start, whose only remedy would be editing the audit log, which is
 	// precisely the act the chain exists to make suspicious.
 	TruncatedTail bool
+	// UnterminatedFinalRecord reports that the final line held a complete
+	// record that decoded and verified, but carried no terminating newline.
+	// The record is counted: it is evidence, not debris.
+	//
+	// It is a separate field from TruncatedTail rather than a second meaning
+	// for it, because the two demand opposite responses. A torn tail must be
+	// cut off before anything is appended; this one must have a newline added,
+	// and cutting it off would destroy a record that verifies.
+	UnterminatedFinalRecord bool
 }
 
 // Verify walks a log and recomputes the chain. It returns an error only if
@@ -197,22 +209,32 @@ func Verify(r io.Reader) (VerifyResult, error) {
 			return res, fmt.Errorf("audit: read log: %w", err)
 		}
 
+		// ReadString reports no error when it found the delimiter, so EOF here
+		// always means this is the last line, and a missing newline always
+		// means the file stops in the middle of one. Both facts are captured
+		// now because chainHash below reuses err.
+		atEOF := errors.Is(err, io.EOF)
 		terminated := strings.HasSuffix(raw, "\n")
+		// TrimSpace also removes a carriage return, so a log whose line
+		// endings were rewritten to CRLF in transit still verifies rather than
+		// reading as an edited file.
 		line := strings.TrimSpace(raw)
 
 		if line == "" {
-			if errors.Is(err, io.EOF) {
+			if atEOF {
 				break
 			}
 			continue
 		}
 
-		// An unterminated final line is an interrupted write. Stop here and
-		// report the truncation; the records before it stand.
-		if !terminated && errors.Is(err, io.EOF) {
-			res.TruncatedTail = true
-			break
-		}
+		// A missing final newline decides nothing on its own. It is equally
+		// what a process killed mid-write leaves and what any editor produces
+		// for free, so the line is decoded and checked like every other, and
+		// only its verdict says which it was. Assuming a torn write here is
+		// what let a one-byte deletion turn tamper detection into tamper
+		// erasure: the caller discarded the "partial" record as debris and the
+		// altered log came out looking clean.
+		unterminated := !terminated && atEOF
 
 		// DisallowUnknownFields because the chain covers the record's fields,
 		// not the bytes of the line. Without it, arbitrary keys can be spliced
@@ -221,10 +243,34 @@ func Verify(r io.Reader) (VerifyResult, error) {
 		var rec Record
 		dec := json.NewDecoder(strings.NewReader(line))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&rec); err != nil {
+		if derr := dec.Decode(&rec); derr != nil {
+			// The one place an unterminated line is read leniently, and only
+			// because JSON that stops in the middle is precisely what a killed
+			// process leaves behind. Refusing to start on that would turn one
+			// OOM kill into a crash loop whose only remedy is editing the
+			// audit log, which is the act the chain exists to make suspicious.
+			if unterminated {
+				res.TruncatedTail = true
+				break
+			}
 			res.OK = false
 			res.BreakAt = lastSeq + 1
-			res.Problem = fmt.Sprintf("could not decode record: %v", err)
+			res.Problem = fmt.Sprintf("could not decode record: %v", derr)
+			return res, nil
+		}
+
+		// Decode reads one JSON value and stops, saying nothing about what
+		// follows it on the line. That is the same hole DisallowUnknownFields
+		// closes, one step over: a forged record concatenated onto an audited
+		// line is invisible to a verifier that stops after the first value,
+		// while any reader walking the line as a JSON stream sees both. The
+		// decoder must be exhausted, so anything but EOF is a break. A torn
+		// write cannot produce this shape either, because each record and its
+		// newline go out in one Write.
+		if derr := dec.Decode(new(Record)); !errors.Is(derr, io.EOF) {
+			res.OK = false
+			res.BreakAt = lastSeq + 1
+			res.Problem = "trailing bytes after the record on its line"
 			return res, nil
 		}
 
@@ -259,7 +305,16 @@ func Verify(r io.Reader) (VerifyResult, error) {
 		res.Head = rec.Hash
 		res.LastSeq = rec.Seq
 
-		if errors.Is(err, io.EOF) {
+		// A complete record that lost only its newline. It verified, so it is
+		// evidence and it counts; the caller is told the file needs a byte
+		// added rather than a record removed. Conflating this with a torn tail
+		// would have the caller delete a record that verifies.
+		//
+		// This is also the only way out of the loop from down here: a
+		// terminated line leaves ReadString with no error, so the file's end
+		// arrives as the empty line above.
+		if unterminated {
+			res.UnterminatedFinalRecord = true
 			break
 		}
 	}

@@ -10,6 +10,11 @@
 .github/
 .claude/
 
+# Automation worktrees hold whole copies of the repository, so leaving them in
+# the context is the same gigabyte-scale mistake as .terraform/ above.
+.worktrees/
+.deep-dive/
+
 docs/
 README.md
 LICENSE

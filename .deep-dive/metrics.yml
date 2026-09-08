@@ -1,0 +1,45 @@
+metrics:
+  schema_version: "1.0"
+  last_updated: "2026-09-08T15:05:00Z"
+  runs:
+    - run_id: "2026-09-08T14:14:00Z"
+      scope: "full"
+      mode: "full"
+      duration_minutes: 55
+      findings_by_severity:
+        critical: 1
+        high: 8
+        medium: 17
+        low: 35
+      findings_by_module:
+        internal/audit: { critical: 0, high: 2 }
+        cmd/egressgate: { critical: 1, high: 1 }
+        internal/policy: { critical: 0, high: 1 }
+        internal/proxy: { critical: 0, high: 1 }
+        terraform: { critical: 0, high: 1 }
+        ci-and-docs: { critical: 0, high: 2 }
+      findings_by_category:
+        audit-chain-integrity: 4
+        false-green-tests: 9
+        documented-vs-shipped: 10
+        policy-parsing: 4
+        infrastructure: 12
+        build-gate-vacuity: 5
+      fixes_attempted: 14
+      fixes_successful: 14
+      false_positives_critical: 0
+      ci_passed: true
+      ledger_health:
+        open_before: 0
+        open_after: 12
+        net_intake: 12
+        ceiling: 20
+        rulings_open: 3
+        closed_as: { fixed: 0, below_the_line: 0, default_applied: 0, aged_out: 0, refuted: 0 }
+      notes: >
+        Establishing pass: no ledger existed, so net_intake is necessarily
+        positive and the zero-intake rule does not apply. Everything fixed this
+        pass was fixed rather than filed; the 12 open entries are what was not.
+        The race detector could not run locally (no C compiler) -- ci_passed
+        reflects the local serial gate plus a locally-executed container job,
+        with the race gate delegated to CI.

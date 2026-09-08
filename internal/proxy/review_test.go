@@ -21,7 +21,18 @@ import (
 // returns as soon as headers arrive, so an upstream that answers before
 // draining the body has the handler reading the byte counter while the
 // transport is still writing it. Fails under -race before the fix.
+//
+// The race detector is only half of the property, and it is the half that
+// cannot fail when the suite runs without -race. So the counter's output is
+// checked as well: every record must report a byte count that is a plausible
+// prefix of the body that was offered, and the counter has to be wired to the
+// body at all rather than reporting a constant zero. An unsynchronised int64
+// can be torn or stale, and a stale read is what the bounds catch here; the
+// race detector remains the sharper instrument, so this does not replace it.
 func TestByteCounterIsSafeWhenUpstreamAnswersEarly(t *testing.T) {
+	const bodySize = 1 << 20
+	const requests = 20
+
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Answer immediately without reading the body.
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
@@ -32,8 +43,8 @@ func TestByteCounterIsSafeWhenUpstreamAnswersEarly(t *testing.T) {
 	g := newGate(t, allowHost(t, up.URL), DefaultConfig())
 	client := proxiedClient(t, g.URL())
 
-	for i := 0; i < 20; i++ {
-		body := strings.NewReader(strings.Repeat("x", 1<<20))
+	for i := 0; i < requests; i++ {
+		body := strings.NewReader(strings.Repeat("x", bodySize))
 		req, err := http.NewRequest(http.MethodPost, up.URL, body)
 		if err != nil {
 			t.Fatal(err)
@@ -42,8 +53,45 @@ func TestByteCounterIsSafeWhenUpstreamAnswersEarly(t *testing.T) {
 		if err != nil {
 			continue // a reset mid-upload is fine; the race is what matters
 		}
+		// 413 relayed from the upstream, or 502 if the upload was reset before
+		// the gate could read the response. Anything else is the gate inventing
+		// a status of its own.
+		if resp.StatusCode != http.StatusRequestEntityTooLarge && resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("status = %d, want the upstream's 413 or a 502 from a reset upload", resp.StatusCode)
+		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+	}
+
+	// Every request reached the handler, so every request produced a record,
+	// whether or not the client saw the response. A transport retry can add one
+	// more, which is why this is a floor rather than an equality.
+	recs := g.waitForAuditRecords(t, requests)
+
+	var counted int
+	for i, rec := range recs {
+		if rec.Decision != "allow" {
+			t.Errorf("record %d: Decision = %q, want allow; the policy permits this host", i, rec.Decision)
+		}
+		if rec.Status != http.StatusRequestEntityTooLarge && rec.Status != http.StatusBadGateway {
+			t.Errorf("record %d: Status = %d, want 413 from the upstream or 502 from a reset upload",
+				i, rec.Status)
+		}
+		// The upstream never drains the body, so a short count is the expected
+		// case and a full body is legal. More than was offered, or a negative
+		// count, is neither: it would mean the counter was double-counted or
+		// read while it was being written.
+		if rec.BytesUp < 0 || rec.BytesUp > bodySize {
+			t.Errorf("record %d: BytesUp = %d, want 0..%d; the counter reported more than the body it was given",
+				i, rec.BytesUp, bodySize)
+		}
+		if rec.BytesUp > 0 {
+			counted++
+		}
+	}
+	if counted == 0 {
+		t.Errorf("all %d uploads recorded BytesUp = 0; the byte counter is not attached to the request body",
+			len(recs))
 	}
 }
 
@@ -54,10 +102,20 @@ func TestByteCounterIsSafeWhenUpstreamAnswersEarly(t *testing.T) {
 func TestDotSegmentsCannotSatisfyAPathRule(t *testing.T) {
 	var seen atomic.Value
 	seen.Store("")
-	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen.Store(r.URL.RequestURI())
-		io.WriteString(w, "reached")
-	}))
+
+	// A counting listener, not a plain httptest server: what the upstream
+	// received is the symptom, and what it accepted is the containment. This
+	// request is refused before the policy is even consulted, so the accept
+	// count is the only thing that pins the gate to refusing before it dials.
+	counting := newCountingListener(t)
+	up := &httptest.Server{
+		Listener: counting,
+		Config: &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen.Store(r.URL.RequestURI())
+			io.WriteString(w, "reached")
+		})},
+	}
+	up.Start()
 	defer up.Close()
 
 	pol := allowHost(t, up.URL)
@@ -98,6 +156,7 @@ func TestDotSegmentsCannotSatisfyAPathRule(t *testing.T) {
 			if reached := seen.Load().(string); reached != "" {
 				t.Errorf("upstream received %q; a path rule was bypassed", reached)
 			}
+			assertNoAccepts(t, counting)
 		})
 	}
 }
@@ -324,11 +383,7 @@ func TestCapIsNotReportedWhenAStreamEndsExactlyOnIt(t *testing.T) {
 // that dialled the upstream and then hung up would pass a handler-count test
 // while providing no containment.
 func TestDeniedRequestOpensNoConnectionToUpstream(t *testing.T) {
-	base, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	counting := &countingListener{Listener: base}
+	counting := newCountingListener(t)
 
 	up := &httptest.Server{
 		Listener: counting,
@@ -338,7 +393,6 @@ func TestDeniedRequestOpensNoConnectionToUpstream(t *testing.T) {
 	defer up.Close()
 
 	g := newGate(t, denyAll(), DefaultConfig())
-	before := counting.count()
 
 	resp, err := proxiedClient(t, g.URL()).Get(up.URL)
 	if err != nil {
@@ -349,25 +403,8 @@ func TestDeniedRequestOpensNoConnectionToUpstream(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", resp.StatusCode)
 	}
-	if got := counting.count() - before; got != 0 {
-		t.Errorf("upstream accepted %d connections on a denied request, want 0", got)
-	}
+	assertNoAccepts(t, counting)
 }
-
-type countingListener struct {
-	net.Listener
-	accepted atomic.Int64
-}
-
-func (l *countingListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err == nil {
-		l.accepted.Add(1)
-	}
-	return c, err
-}
-
-func (l *countingListener) count() int64 { return l.accepted.Load() }
 
 // Under default: allow, a CONNECT with no host would rejoin as ":443" and
 // dial the gate itself.

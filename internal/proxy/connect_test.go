@@ -98,6 +98,85 @@ func TestConnectDeniedNeverOpensATunnel(t *testing.T) {
 	}
 }
 
+// TestDeniedConnectOpensNoConnectionToUpstream is the CONNECT half of the
+// claim the README rests on: a denied request never reaches the upstream.
+//
+// The tests either side of it count TLS handler invocations, which is the
+// weaker property and cannot carry the claim. A gate that dialled the upstream
+// and only then answered 403 opens a real TCP connection to a host the policy
+// forbade; it never completes a TLS handshake and never runs a handler, so a
+// handler count sits at zero while the containment is gone. Counting accepted
+// connections is what actually pins the ordering, and this is the CONNECT
+// equivalent of TestDeniedRequestOpensNoConnectionToUpstream on the HTTP path.
+//
+// Both shapes of denial are covered, because they leave handleConnect through
+// the same branch but for different reasons: no rule at all, and a rule that
+// matches the host but cannot authorise a tunnel. The second is the one a gate
+// dialling on a host match alone would slip past.
+func TestDeniedConnectOpensNoConnectionToUpstream(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(t *testing.T, upURL string) *policy.Policy
+	}{
+		{
+			name: "no rule matches the host",
+			build: func(*testing.T, string) *policy.Policy {
+				return denyAll()
+			},
+		},
+		{
+			name: "rule matches the host but constrains a method",
+			build: func(t *testing.T, upURL string) *policy.Policy {
+				t.Helper()
+				pol := allowHost(t, upURL)
+				pol.Rules[0].Methods = []string{"GET"}
+				return pol
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// A bare TCP upstream: a tunnel the gate opens and abandons never
+			// gets as far as TLS, so there is nothing for a TLS server to add.
+			up := newCountingListener(t)
+			serveNothing(t, up)
+
+			g := newGate(t, tc.build(t, up.https()), DefaultConfig())
+			gu, err := url.Parse(g.URL())
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn, err := net.Dial("tcp", gu.Host)
+			if err != nil {
+				t.Fatalf("Dial() error = %v", err)
+			}
+			defer conn.Close()
+
+			fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", up.addr(), up.addr())
+			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			buf := make([]byte, 512)
+			n, err := conn.Read(buf)
+			if err != nil {
+				t.Fatalf("reading proxy response: %v", err)
+			}
+
+			// The client still gets a refusal it can act on...
+			got := string(buf[:n])
+			if !strings.Contains(got, "403") {
+				t.Errorf("proxy response = %q, want 403", got)
+			}
+			if !strings.Contains(got, "denied by policy") {
+				t.Errorf("proxy response = %q, want it to say why", got)
+			}
+
+			// ...and the forbidden host was never contacted, which is the half
+			// that is worth anything.
+			assertNoAccepts(t, up)
+		})
+	}
+}
+
 // The design's central rule, exercised through a real socket: a rule that
 // constrains a method cannot be used to authorise a tunnel, because the gate
 // cannot see the method once TLS starts.

@@ -19,3 +19,6 @@ terraform/modules/*/.terraform.lock.hcl
 
 # Claude Code worktrees live here; they are workspaces, not repository content.
 .claude/worktrees/
+
+# Deep-dive/autobuild run worktrees live here; workspaces, not repository content.
+.worktrees/
