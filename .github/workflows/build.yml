@@ -145,6 +145,12 @@ jobs:
           # the same stream, so the CloudWatch log is interleaved in a way this
           # file is not; see the audit-log limits in the README.
           docker logs egci 2>/dev/null > container-audit.log
+
+          # And capture the streams MERGED, which is how the awslogs driver
+          # presents them in CloudWatch. `docker logs` keeps them apart, so
+          # without this the job cannot see the one difference between the log
+          # it verifies here and the log the deployment actually produces.
+          docker logs egci > merged-audit.log 2>&1
           docker rm -f egci >/dev/null
 
           # Assert the records exist before asserting they verify. An empty log
@@ -158,6 +164,21 @@ jobs:
 
           go build -o egressgate ./cmd/egressgate
           ./egressgate verify --audit container-audit.log
+
+          # The merged stream is what an operator fetches from CloudWatch, and
+          # it does not parse: a diagnostic line is not a record. Assert that
+          # it fails, then assert the documented extraction recipe recovers it.
+          # The negative control is the load-bearing half -- without it the
+          # extraction could silently become a no-op and this step would still
+          # pass on the already-clean stdout log.
+          if ./egressgate verify --audit merged-audit.log >/dev/null 2>&1; then
+            echo "merged stream verified, so it carried no diagnostics -- the" >&2
+            echo "extraction path below is no longer testing anything" >&2
+            exit 1
+          fi
+          scripts/extract-audit.sh < merged-audit.log > extracted-audit.log
+          ./egressgate verify --audit extracted-audit.log
+          diff container-audit.log extracted-audit.log
 
   terraform:
     runs-on: ubuntu-latest
