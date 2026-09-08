@@ -3,6 +3,22 @@
 Closed findings, newest first. Historical audit trail: this file is **not**
 loaded at the start of a run and must never be pasted into an agent prompt.
 
+## 2026-09-08 (later)
+
+### `hours` · FIXED — Base images float while every tool is pinned
+
+Both `Dockerfile` bases are now pinned by digest alongside their tags
+(`golang:1.27-alpine@sha256:cf6fca66…`, `alpine:3.24@sha256:28bd5fe8…`), so the
+two inputs that actually ship are pinned as tightly as terraform, tflint,
+golangci-lint and govulncheck already were. A tag is mutable; the image CI
+verified and the image a later build produced need not have been the same bytes.
+
+Found in the same pass that the Docker ecosystem was added to
+`.github/dependabot.yml`, which immediately reported both images four and seven
+versions behind. Dependabot updates a digest pin in place, so it now keeps them
+current rather than letting them drift the other way. Build verified locally
+against both digests, and the `container` job exercises the resulting image.
+
 ## 2026-09-08
 
 ### `money` · RULED — Chain continuity is unachievable in the shipped config
