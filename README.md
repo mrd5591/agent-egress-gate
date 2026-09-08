@@ -282,7 +282,7 @@ go test ./... -race          # every test runs under the race detector
 ./scripts/coverage.sh        # same coverage floor CI uses
 ```
 
-Test-driven throughout: 94% statement coverage, and the uncovered remainder is
+Test-driven throughout: 93% statement coverage, and the uncovered remainder is
 listed in the code with the reason it cannot be reached. The tests that carry
 the most weight are the ones asserting a denied request **never reaches the
 upstream**, rather than merely that the client saw a 403. A proxy that
