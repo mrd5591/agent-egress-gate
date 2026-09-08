@@ -8,7 +8,10 @@ set -euo pipefail
 FLOOR="${COVERAGE_FLOOR:-90}"
 PROFILE="${COVERAGE_PROFILE:-coverage.out}"
 
-go test -race -covermode=atomic -coverprofile="$PROFILE" ./...
+# -shuffle=on because several tests bind sockets and share timing assumptions;
+# a suite that only passes in declaration order is a suite with a hidden
+# dependency, and this is the cheapest way to keep finding that out.
+go test -race -shuffle=on -covermode=atomic -coverprofile="$PROFILE" ./...
 
 TOTAL="$(go tool cover -func="$PROFILE" | awk '/^total:/ {print $3}' | tr -d '%')"
 
