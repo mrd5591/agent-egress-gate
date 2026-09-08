@@ -32,7 +32,9 @@ const (
 	exitOK    = 0
 	exitFail  = 1
 	exitUsage = 2
-	// exitTruncated says a chain verifies but stops mid-record.
+	// exitTruncated says a chain verifies but the file does not end where a
+	// record ends: either the last line is torn, or it holds a record that
+	// verifies and is missing only its newline.
 	//
 	// It is deliberately neither 0 nor 1. Not 0, because a gate wired to the
 	// exit status would otherwise walk past a torn log without anyone reading
@@ -57,8 +59,9 @@ Commands:
            must never be reachable by the agent.
   verify   Recompute an audit log's hash chain and report the first break.
            Exits 0 when the chain is intact and complete, 1 when it is broken,
-           and 3 when it is intact but stops mid-record, which a crash can
-           cause and a deliberate truncation looks identical to.
+           and 3 when it verifies but the file does not end at a record
+           boundary, which a crash can cause and a deliberate truncation
+           looks identical to.
   check    Ask what the policy would decide, without running anything.
            Exits 0 on allow and 1 on deny, so it works in a CI gate.
 `
@@ -276,6 +279,14 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 // the very act the chain exists to make suspicious. So the gate resumes from
 // the last complete record, says loudly that it discarded a partial one, and
 // keeps running.
+//
+// A file missing only the newline after a record that verifies is a third
+// thing again, and the one worth being careful about: it is what deleting one
+// byte from a tampered log produces. Verify judges that record rather than
+// assuming it, so tampering arrives here as a broken chain and is refused
+// above, and the genuine case is repaired by adding the byte back. Discarding
+// it as debris would have the gate destroy a verified record, and leave a log
+// that verifies clean afterwards.
 func existingChainHead(path string, stderr io.Writer) (string, uint64, error) {
 	// #nosec G304 -- operator-supplied flag.
 	f, err := os.Open(path)
@@ -313,7 +324,40 @@ func existingChainHead(path string, stderr io.Writer) (string, uint64, error) {
 				"the %d complete records verify.\n",
 			path, dropped, res.LastSeq, res.Records)
 	}
+	if res.UnterminatedFinalRecord {
+		// The opposite response to a file that looks the same from the outside,
+		// which is why the two arrive as separate fields. Here the final record
+		// decoded and verified and only its newline is missing, so truncating
+		// back to the previous line would delete a complete record: the gate
+		// erasing its own evidence to tidy up. The byte is added instead and
+		// the record keeps its place in the chain.
+		if aerr := appendMissingNewline(path); aerr != nil {
+			return "", 0, fmt.Errorf("terminating the final record of %s: %w", path, aerr)
+		}
+		fmt.Fprintf(stderr,
+			"egressgate: %s ended without the newline after record %d, so a previous run stopped\n"+
+				"  between writing that record and terminating its line. The record itself verifies,\n"+
+				"  so it was kept: appended the missing newline and resumed from it, with all %d\n"+
+				"  records intact.\n",
+			path, res.LastSeq, res.Records)
+	}
 	return res.Head, res.LastSeq, nil
+}
+
+// appendMissingNewline terminates a final line holding a complete, verified
+// record. Appending the next record without it would put two records on one
+// line, which the verifier reads as trailing bytes and refuses.
+func appendMissingNewline(path string) error {
+	// #nosec G304 -- operator-supplied flag, the same path already verified.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString("\n"); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // truncatePartialLine cuts a file back to the end of its last complete line
@@ -428,6 +472,22 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 				"  Every complete record verifies and the partial one is not counted. A chain\n"+
 				"  cannot distinguish this from a tail someone removed, so compare the head above\n"+
 				"  against the one the gate printed when it shut down.")
+		return exitTruncated
+	}
+	if res.UnterminatedFinalRecord {
+		// Not exit 0, which claims a log that is intact and complete: this one
+		// does not end at a record boundary. Every record is counted, because
+		// the last one decoded and verified rather than being assumed to be
+		// debris, but a file the writer never finished terminating is still a
+		// file whose end nobody can vouch for, and it shares its exit code
+		// with the torn case for that reason. What it does not share is the
+		// remedy, so the note says which one this is.
+		fmt.Fprintln(stdout,
+			"note: the final record is complete and verifies, but its newline is missing,\n"+
+				"  so the last write stopped one byte short. Every record above is counted. A\n"+
+				"  chain cannot distinguish this from a file someone truncated at that exact\n"+
+				"  offset, so compare the head above against the one the gate printed when it\n"+
+				"  shut down; the gate itself appends the newline and keeps the record.")
 		return exitTruncated
 	}
 	return exitOK

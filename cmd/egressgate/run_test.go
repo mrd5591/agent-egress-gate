@@ -72,10 +72,13 @@ func TestCheckAllowsAPermittedRequest(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut)
 	}
-	if !strings.Contains(out, "allow") {
+	// The rendered decision line, not the bare word. "allow" alone would also
+	// match a deny whose reason happened to mention allowing, and "gh" alone
+	// matches the host it is a prefix of.
+	if !strings.Contains(out, "decision:     allow") {
 		t.Errorf("stdout = %q, want it to say allow", out)
 	}
-	if !strings.Contains(out, "gh") {
+	if !strings.Contains(out, "rule:         gh") {
 		t.Errorf("stdout = %q, want it to name the matching rule", out)
 	}
 }
@@ -86,7 +89,7 @@ func TestCheckDeniesAndExitsOne(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(out, "deny") {
+	if !strings.Contains(out, "decision:     deny") {
 		t.Errorf("stdout = %q, want it to say deny", out)
 	}
 }
@@ -100,8 +103,14 @@ func TestCheckModelsConnectForHTTPSURLs(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit = %d, want 1; a method-constrained rule cannot authorise a tunnel", code)
 	}
-	if !strings.Contains(out, "tunnel") {
-		t.Errorf("stdout = %q, want it to explain the tunnel restriction", out)
+	// The reason, not the word "tunnel": that word is also in the "evaluated
+	// as: CONNECT tunnel to ..." line, which prints for every https URL
+	// whatever the decision, so matching it proves nothing about the
+	// restriction being explained.
+	const wantReason = "rule gh matched host but constrains method or path, " +
+		"which cannot be enforced inside a tunnel"
+	if !strings.Contains(out, wantReason) {
+		t.Errorf("stdout = %q, want it to explain the tunnel restriction:\n%s", out, wantReason)
 	}
 
 	code2, out2, _ := runCLI(t, "check", "--policy", p, "GET", "https://pypi.org/simple/")
@@ -115,7 +124,9 @@ func TestCheckRequiresAPolicy(t *testing.T) {
 	if code != 2 {
 		t.Errorf("exit = %d, want 2", code)
 	}
-	if !strings.Contains(errOut, "policy") {
+	// The sentence, not the word: the flag dump that follows lists "-policy"
+	// whatever went wrong, so "policy" alone would match a different failure.
+	if !strings.Contains(errOut, "--policy is required") {
 		t.Errorf("stderr = %q, want it to mention the missing flag", errOut)
 	}
 }
@@ -133,7 +144,10 @@ func TestCheckRejectsAMalformedURL(t *testing.T) {
 	if code != 2 {
 		t.Errorf("exit = %d, want 2", code)
 	}
-	if !strings.Contains(errOut, "URL") && !strings.Contains(errOut, "url") {
+	// The message, not either casing of "url": stderr echoes the argument,
+	// and the argument here is literally "not-a-url", so the old pair of
+	// checks was satisfied by the input rather than by any diagnosis of it.
+	if !strings.Contains(errOut, `"not-a-url" is not an absolute URL`) {
 		t.Errorf("stderr = %q, want it to name the bad URL", errOut)
 	}
 }
@@ -164,11 +178,14 @@ func TestVerifyOnAGoodChainExitsZero(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0; stderr = %s", code, errOut)
 	}
-	if !strings.Contains(out, "3") {
-		t.Errorf("stdout = %q, want the record count", out)
-	}
-	if !strings.Contains(strings.ToLower(out), "intact") && !strings.Contains(strings.ToLower(out), "ok") {
-		t.Errorf("stdout = %q, want a clear verdict", out)
+	// The whole phrase. A bare Contains(out, "3") is not a test: verify also
+	// prints a 64-character hex head, so almost any digit matches it and the
+	// count could be anything at all. Asserting the rendered line covers the
+	// verdict too, so the looser "intact or ok" check it replaces is subsumed
+	// rather than dropped.
+	const want = "chain intact: 3 records"
+	if !strings.Contains(out, want) {
+		t.Errorf("stdout = %q, want it to contain %q", out, want)
 	}
 }
 
@@ -192,8 +209,18 @@ func TestVerifyOnATamperedChainExitsOneAndNamesTheSequence(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(out, "2") {
-		t.Errorf("stdout = %q, want the breaking sequence number", out)
+	// Naming the record is the whole point of this test, so it asserts the
+	// name. The hex head and the surrounding prose make a bare Contains on a
+	// single digit true no matter which record the code blames.
+	const wantBreak = "chain BROKEN at record 2:"
+	if !strings.Contains(out, wantBreak) {
+		t.Errorf("stdout = %q, want it to contain %q", out, wantBreak)
+	}
+	// How much of the log stood before the break is the other half of the
+	// answer, and nothing asserted it before.
+	const wantSurvivors = "1 records verified before the break"
+	if !strings.Contains(out, wantSurvivors) {
+		t.Errorf("stdout = %q, want it to contain %q", out, wantSurvivors)
 	}
 }
 
@@ -202,7 +229,7 @@ func TestVerifyRequiresAnAuditPath(t *testing.T) {
 	if code != 2 {
 		t.Errorf("exit = %d, want 2", code)
 	}
-	if !strings.Contains(errOut, "audit") {
+	if !strings.Contains(errOut, "--audit is required") {
 		t.Errorf("stderr = %q, want it to mention the missing flag", errOut)
 	}
 }
@@ -306,7 +333,7 @@ func TestServeRequiresAPolicy(t *testing.T) {
 	if code != 2 {
 		t.Errorf("exit = %d, want 2", code)
 	}
-	if !strings.Contains(errOut, "policy") {
+	if !strings.Contains(errOut, "one of --policy or --policy-env is required") {
 		t.Errorf("stderr = %q, want it to mention the missing flag", errOut)
 	}
 }
@@ -379,8 +406,11 @@ func TestServeFailsWhenTheDataPortIsTaken(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(errOut, "listening") {
-		t.Errorf("stderr = %q, want it to name the bind failure", errOut)
+	// With the address, because "listening" alone is also in the successful
+	// startup banner: an operator reading this needs to know which of the two
+	// listeners refused to bind.
+	if want := "listening on " + busy.Addr().String(); !strings.Contains(errOut, want) {
+		t.Errorf("stderr = %q, want it to name the bind failure as %q", errOut, want)
 	}
 }
 
@@ -399,8 +429,8 @@ func TestServeFailsWhenTheAdminPortIsTaken(t *testing.T) {
 	if code != 1 {
 		t.Errorf("exit = %d, want 1", code)
 	}
-	if !strings.Contains(errOut, "listening") {
-		t.Errorf("stderr = %q, want it to name the bind failure", errOut)
+	if want := "listening on " + busy.Addr().String(); !strings.Contains(errOut, want) {
+		t.Errorf("stderr = %q, want it to name the bind failure as %q", errOut, want)
 	}
 }
 

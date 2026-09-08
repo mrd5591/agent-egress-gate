@@ -96,12 +96,27 @@ rules:
     hosts: ["pypi.org", "*.pypi.org", "files.pythonhosted.org"]
 ```
 
-Two rules that catch people out, both chosen so the surprising direction is
-the safe one:
+Rules that catch people out, all chosen so the surprising direction is the safe
+one:
 
 - `*.example.com` matches one or more subdomain labels and **not** the apex.
   Want both? Write both.
 - A rule with no `ports` covers **80 and 443 only**, never every port.
+- `paths` matches on **segment** boundaries, not raw prefixes. `/v1/status`
+  covers `/v1/status` and `/v1/status/detail`, but not `/v1/status-admin` —
+  a neighbouring endpoint you did not list should not be reachable because its
+  name starts the same way.
+- The policy is parsed **strictly**: an unknown key is an error, not a shrug.
+  This matters more than it sounds. Mistyping `paths:` as `path:` used to drop
+  the constraint silently, and a rule written to permit one method on one path
+  became host-only — which, per the CONNECT rule above, is exactly the shape
+  that authorises a full HTTPS tunnel. The typo widened the rule instead of
+  narrowing it. An explicitly empty `paths: []` or `methods: []` is rejected
+  for the same reason: it reads as "permit nothing" and would have meant
+  "constrain nothing".
+- `default: allow` parses. It is legal so the file can express it, but it turns
+  the gate into a pass-through and disables the CONNECT protection above. If
+  you find it in a deployed policy, that is the finding.
 
 ## Audit log
 
@@ -122,7 +137,7 @@ chain BROKEN at record 2: record hash eebe75… does not match the recomputed ha
 1 records verified before the break
 ```
 
-Three honest limits:
+Some honest limits:
 
 - This is tamper **evidence**, not tamper resistance. Someone who can rewrite
   the whole file can rebuild a consistent chain. `serve` prints the chain head
@@ -147,6 +162,30 @@ Three honest limits:
   crash loop whose only remedy is editing the audit log. A record that was
   actually altered still stops the gate, and the error names a new file to
   start a fresh chain in, so the log stays as evidence.
+
+  That distinction is drawn by *reading* the final line, not by whether it ends
+  in a newline. An earlier version treated those as the same question, and
+  deleting one byte was enough to turn a detected tamper into a silent repair:
+  the gate read the altered record as an interrupted write and truncated the
+  evidence away. Now an unterminated final line is decoded and hash-checked like
+  any other. One that does not parse is a torn write and is discarded as before;
+  one that parses but fails its hash is tampering and stops the gate; one that
+  parses and verifies is a complete record that lost only its newline, so the
+  newline is restored and the record kept.
+- **Continuing a chain needs a file to read.** Resuming re-reads the existing
+  log, so it happens only under `--audit <path>`. With the default stdout sink
+  there is nothing to read back and every start begins a new chain at sequence
+  1. The ECS task definition in this repo runs on stdout, so its restarts do
+  exactly that: sequence numbers are per-process there, and continuity across a
+  deploy is CloudWatch's ordering rather than the chain's.
+- **On ECS the log stream is not directly verifiable.** The `awslogs` driver
+  sends the container's stdout *and* stderr to one CloudWatch stream, and the
+  gate's diagnostics — the startup line, the shutdown chain head, structured
+  logs — go to stderr. Interleaved, the stream is no longer one JSON object per
+  line, and `verify` stops at the first diagnostic. Extract the record lines
+  before verifying it. The `container` CI job does not hit this because `docker
+  logs` keeps the two streams apart and the job reads only stdout; that is the
+  one way that job does not reproduce the deployment.
 - The hashed bytes are Go's `encoding/json` output, which escapes `<`, `>` and
   `&` as `\u003c`, `\u003e` and `\u0026`. Writer and verifier agree, so this is
   invisible in normal use, but a verifier reimplemented in another language
@@ -168,6 +207,11 @@ can reload the policy can replace the policy that constrains it.
   --idle-timeout 5m \
   --max-tunnel-bytes 0        # 0 means no cap; set it to bound one tunnel
 ```
+
+Two more exist and are worth knowing about: `--dial-timeout` (10s) bounds
+reaching the upstream, and `--response-header-timeout` (30s) bounds waiting for
+it to answer. `--audit` defaults to stdout, and both listeners default to
+loopback, so the flags above are what open the gate to anything.
 
 `--max-tunnel-bytes` is a resource guard, not an exfiltration control. It caps
 each direction of a CONNECT tunnel, and nothing else: the plain-HTTP path has
@@ -207,8 +251,11 @@ matters is not the service, it is the two security groups:
 
 - **gate**: ingress on the proxy port from the agent group only; egress to the
   internet.
-- **agent**: egress **only** to the gate on the proxy port. It has no other
-  outbound rule.
+- **agent**: egress to the gate on the proxy port, and — only if you wire the
+  VPC endpoints described below — 443 to those endpoints so the task can pull
+  its image. Nothing else. Leave the endpoint variables empty and the gate is
+  the single outbound rule, which is the strictest form and the one the prose
+  here is really about.
 
 Attach `agent_security_group_id` to your agent tasks and the gate stops being
 advice. IAM is scoped to the one log group, the one ECR repository and the one
@@ -282,7 +329,7 @@ go test ./... -race          # every test runs under the race detector
 ./scripts/coverage.sh        # same coverage floor CI uses
 ```
 
-Test-driven throughout: 93% statement coverage, and the uncovered remainder is
+Test-driven throughout: 94% statement coverage, and the uncovered remainder is
 listed in the code with the reason it cannot be reached. The tests that carry
 the most weight are the ones asserting a denied request **never reaches the
 upstream**, rather than merely that the client saw a 403. A proxy that

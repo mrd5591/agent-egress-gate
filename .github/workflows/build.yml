@@ -140,8 +140,21 @@ jobs:
 
           # stdout must be audit records and nothing else, because that is what
           # the awslogs driver collects and what `verify` has to read.
+          #
+          # Note this reads only stdout. The awslogs driver merges stderr into
+          # the same stream, so the CloudWatch log is interleaved in a way this
+          # file is not; see the audit-log limits in the README.
           docker logs egci 2>/dev/null > container-audit.log
           docker rm -f egci >/dev/null
+
+          # Assert the records exist before asserting they verify. An empty log
+          # is an intact chain of zero records and exits 0, so `verify` alone
+          # would pass a container that produced no audit output at all -- which
+          # is the one failure this job exists to catch.
+          test -s container-audit.log
+          records="$(grep -c '^{' container-audit.log)"
+          echo "audit records: $records"
+          test "$records" -ge 2
 
           go build -o egressgate ./cmd/egressgate
           ./egressgate verify --audit container-audit.log
