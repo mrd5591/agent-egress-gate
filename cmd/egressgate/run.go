@@ -32,6 +32,16 @@ const (
 	exitOK    = 0
 	exitFail  = 1
 	exitUsage = 2
+	// exitTruncated says a chain verifies but stops mid-record.
+	//
+	// It is deliberately neither 0 nor 1. Not 0, because a gate wired to the
+	// exit status would otherwise walk past a torn log without anyone reading
+	// the message, and a tail removed on purpose is the one alteration this
+	// chain cannot detect on its own. Not 1, because a crash-truncated log is
+	// not a broken chain and a caller that tolerates one should not have to
+	// tolerate the other. A CI job that accepts crash truncation can test for
+	// this code specifically.
+	exitTruncated = 3
 )
 
 const usage = `egressgate - deny-by-default egress control for headless coding agents
@@ -46,6 +56,9 @@ Commands:
            listener serves /metrics, /healthz, /readyz and POST /reload and
            must never be reachable by the agent.
   verify   Recompute an audit log's hash chain and report the first break.
+           Exits 0 when the chain is intact and complete, 1 when it is broken,
+           and 3 when it is intact but stops mid-record, which a crash can
+           cause and a deliberate truncation looks identical to.
   check    Ask what the policy would decide, without running anything.
            Exits 0 on allow and 1 on deny, so it works in a CI gate.
 `
@@ -406,12 +419,16 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "chain intact: %d records\n", res.Records)
 	fmt.Fprintf(stdout, "head: %s\n", res.Head)
 	if res.TruncatedTail {
-		// Worth saying even though the chain holds: the operator should know
-		// the log stops mid-record, and that the missing decision is missing
-		// because a process died, not because someone removed it.
+		// The chain holds, but it stops mid-record, and a chain cannot tell a
+		// crash-truncated tail from one someone removed. That is the gap the
+		// recorded head exists to close, so this is exactly the moment to
+		// point at it.
 		fmt.Fprintln(stdout,
-			"note: the log ends mid-record, so the last write was interrupted. "+
-				"Every complete record verifies; the partial one is not counted.")
+			"note: the log ends mid-record, so the last write was interrupted.\n"+
+				"  Every complete record verifies and the partial one is not counted. A chain\n"+
+				"  cannot distinguish this from a tail someone removed, so compare the head above\n"+
+				"  against the one the gate printed when it shut down.")
+		return exitTruncated
 	}
 	return exitOK
 }

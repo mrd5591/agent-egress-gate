@@ -128,9 +128,17 @@ Three honest limits:
   the whole file can rebuild a consistent chain. `serve` prints the chain head
   on shutdown so you can record it somewhere the gate cannot write, which is
   what makes truncation of the tail detectable.
+- `verify` exits 0 for an intact, complete chain, 1 for a broken one, and **3**
+  for a chain that verifies but stops mid-record. That third case gets its own
+  code on purpose: a crash produces it, and so does a tail someone removed, and
+  those are indistinguishable without the head you recorded. Exiting 0 would
+  let a gate wired to the exit status walk straight past it.
 - A tunnel's record is written when the tunnel **closes**, because the byte
   counts are not known before then. While a long tunnel is open it is absent
-  from the log. Watch `egressgate_active_tunnels` for that window.
+  from the log. `egressgate_active_tunnels` covers that window, but note that
+  the Terraform module opens the admin port to nothing by default: until you
+  pass `admin_ingress_security_group_ids`, no collector can scrape it and the
+  window is genuinely unobserved.
 - A restart continues the existing chain rather than starting a new one, so a
   deploy does not look like tampering. If a previous run was killed mid-write,
   the gate discards the partial final record, says so on stderr, and resumes
