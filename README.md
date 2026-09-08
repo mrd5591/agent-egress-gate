@@ -191,6 +191,39 @@ Some honest limits:
   invisible in normal use, but a verifier reimplemented in another language
   has to reproduce that escaping. Python's `json.dumps` does not, by default.
 
+### Reading the log the deployment actually produces
+
+The gate writes audit records to stdout and diagnostics to stderr. That is the
+right split for a terminal and for `docker logs`, and it is **not** the split
+the deployment gets: the `awslogs` driver collects both streams into one
+CloudWatch stream, so the log an operator fetches is interleaved and does not
+parse as one JSON object per line. Point `verify` straight at it and you get
+
+```console
+chain BROKEN at record 1: could not decode record: invalid character 'l' looking for beginning of value
+0 records verified before the break
+```
+
+where the `l` is the first letter of a `listening:` startup line. The chain is
+intact. The stream is just not only the chain.
+
+So extract the records first:
+
+```bash
+aws logs tail /ecs/egress-gate --format short   | scripts/extract-audit.sh   | ./egressgate verify --audit /dev/stdin
+```
+
+`scripts/extract-audit.sh` keeps the lines that are audit records and drops
+everything else, and exits 4 if it found none — an empty chain verifies clean,
+so a silent extraction would otherwise read as a healthy gate.
+
+This is deliberately a filter rather than a `--quiet` flag on the gate. The
+diagnostics are worth keeping, and suppressing them would trade a readable log
+for a verifiable one when you can have both. The `container` CI job runs this
+exact path — it merges the two streams the way `awslogs` does, asserts that
+`verify` **fails** on the merged stream, then asserts it passes after
+extraction — so the recipe above cannot rot without the build going red.
+
 ## Running it
 
 Two listeners, and keeping them apart is the point. The data listener carries
