@@ -179,3 +179,46 @@ Test-driven throughout.
 4. A tampered audit log fails verification at the correct sequence number.
 5. A README a hiring engineer can read in three minutes and come away knowing what the thing
    does, what it does not do, and why.
+
+---
+
+## Postscript: what the review found, and the one pattern behind it
+
+Two independent reviewers went over this before it merged, one on the Go and
+one on the infrastructure and docs. Between them they found five critical
+issues. All are fixed, all have regression tests, and the list is kept here
+because the shape of the mistakes is more useful than the fact of them.
+
+| What broke | Where it hid |
+|---|---|
+| The audit stream failed its own verifier in the shipped container | Diagnostics shared stdout with audit records |
+| The ECS task could never start | `command` does not override a Dockerfile `ENTRYPOINT` |
+| A restart began a second chain, so every deploy looked like tampering | `audit.Resume` existed and nothing called it |
+| Two data races on the request path | Tests all drained the body before reading the counter |
+| Both Linux CI legs would have failed on the first push | A script committed without its executable bit |
+
+Four of these, plus three smaller ones found afterwards, are the same mistake
+in different costumes: **a control that is real in one layer and absent in the
+layer that actually ships.**
+
+- A `methods` constraint is real in the policy file and absent inside TLS.
+  That is the CONNECT rule, and it was designed for deliberately.
+- The audit log verified when run as a binary and did not in the container.
+- The `command` was real in the task definition and absent from the image.
+- `MaxTunnelBytes` was documented as bounding egress and caps only tunnels.
+- `POST /reload` works against a policy file and returns 400 in the deployed
+  configuration, which uses `--policy-env`.
+- `egressgate_active_tunnels` is real on the admin listener and unreachable in
+  the module's default, which opens that port to nothing.
+
+The design already rejected this fault in one place, and then committed it in
+five others. So the standing check, worth running against any diff here:
+
+> For every control the documentation claims, is it reachable in the shipped
+> default configuration, or merely implemented somewhere in the tree?
+
+That question finds all six. The `container` CI job is one mechanised instance
+of it, and it is the reason the two critical bugs could not recur: it runs the
+real image the way the task definition does and pipes its stdout through the
+verifier, so it tests the deployed configuration rather than the code's opinion
+of it. Both critical bugs existed because nothing executed the artifact.
