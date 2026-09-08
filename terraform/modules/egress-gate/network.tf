@@ -57,24 +57,43 @@ resource "aws_vpc_security_group_ingress_rule" "gate_admin" {
 # The gate itself needs the internet. This is the only egress to 0.0.0.0/0 in
 # the module, and it belongs to the component whose entire job is deciding
 # what may traverse it.
-resource "aws_vpc_security_group_egress_rule" "gate_to_internet_https" {
+#
+# The ports come from a variable because a policy rule may name any port. When
+# these were hardcoded to 80 and 443, a rule naming anything else was accepted
+# by the policy parser, evaluated as allow, and audited as allow - and then
+# died as an unexplained upstream timeout, with nothing in the evidence log
+# saying the network had refused what the gate permitted.
+#
+# Terraform cannot check the two agree: the policy lives in an SSM parameter
+# (var.policy_parameter_arn) whose contents this module never reads, by design.
+# So the module cannot validate the pair, and the README says plainly that
+# widening a policy's ports means widening this variable too. That is a
+# documented operator obligation, not a closed loop - said here rather than
+# left for someone to discover from a timeout.
+resource "aws_vpc_security_group_egress_rule" "gate_to_internet" {
+  for_each = toset([for p in var.upstream_ports : tostring(p)])
+
   security_group_id = aws_security_group.gate.id
   cidr_ipv4         = "0.0.0.0/0"
-  from_port         = 443
-  to_port           = 443
+  from_port         = tonumber(each.value)
+  to_port           = tonumber(each.value)
   ip_protocol       = "tcp"
-  description       = "Upstream HTTPS, filtered by policy inside the gate"
+  description       = "Upstream port ${each.value}, filtered by policy inside the gate"
   tags              = var.tags
 }
 
-resource "aws_vpc_security_group_egress_rule" "gate_to_internet_http" {
-  security_group_id = aws_security_group.gate.id
-  cidr_ipv4         = "0.0.0.0/0"
-  from_port         = 80
-  to_port           = 80
-  ip_protocol       = "tcp"
-  description       = "Upstream HTTP, filtered by policy inside the gate"
-  tags              = var.tags
+# The two rules above replaced a pair of individually named ones. Without these
+# blocks, upgrading the module would destroy the gate's only egress and
+# recreate it, which for the duration of the apply is an outage of the thing
+# every agent routes through.
+moved {
+  from = aws_vpc_security_group_egress_rule.gate_to_internet_https
+  to   = aws_vpc_security_group_egress_rule.gate_to_internet["443"]
+}
+
+moved {
+  from = aws_vpc_security_group_egress_rule.gate_to_internet_http
+  to   = aws_vpc_security_group_egress_rule.gate_to_internet["80"]
 }
 
 # The agent's only route to anything outside the VPC.

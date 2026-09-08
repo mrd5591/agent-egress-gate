@@ -25,6 +25,20 @@ import (
 // GenesisHash is the Prev value of the first record in a chain.
 const GenesisHash = "0000000000000000000000000000000000000000000000000000000000000000"
 
+// TimeFormat is the layout every record's TS field uses.
+//
+// It is RFC 3339 with nanoseconds always written out, which time.RFC3339Nano
+// is not: that layout uses a trailing-zero-trimming fraction, so a timestamp
+// landing on a microsecond boundary emits fewer digits than its neighbours.
+// The chain does not care — it hashes the string as written — but an evidence
+// log is read, sorted and diffed by people and by tools, and variable-width
+// fractions do not sort lexicographically. Fixed width makes `sort` on the
+// timestamp field agree with chronological order.
+//
+// Records written before this change keep their original strings and still
+// verify; the format is an output choice, not part of the hash definition.
+const TimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
 // Record is one proxy decision.
 //
 // Field order is part of the hash input, because the chain hashes the JSON
@@ -90,10 +104,7 @@ func (l *Log) Append(r Record) (Record, error) {
 
 	r.Seq = l.seq + 1
 	if r.TS == "" {
-		// Nanosecond resolution, because two decisions in the same second are
-		// otherwise indistinguishable by timestamp, which matters when the log
-		// is the evidence.
-		r.TS = l.now().UTC().Format(time.RFC3339Nano)
+		r.TS = l.now().UTC().Format(TimeFormat)
 	}
 	r.Prev = l.prev
 	r.Hash = ""
@@ -189,19 +200,40 @@ type VerifyResult struct {
 	UnterminatedFinalRecord bool
 }
 
-// Verify walks a log and recomputes the chain. It returns an error only if
-// the underlying reader fails; a broken chain is a result, not an error,
-// because "this log was altered" is an answer the caller asked for.
+// Verify walks a whole log from its genesis and recomputes the chain. It
+// returns an error only if the underlying reader fails; a broken chain is a
+// result, not an error, because "this log was altered" is an answer the caller
+// asked for.
+//
+// Use VerifyFrom for a log that does not start at the beginning of its chain.
 func Verify(r io.Reader) (VerifyResult, error) {
-	res := VerifyResult{OK: true, Head: GenesisHash}
+	return VerifyFrom(r, GenesisHash, 0)
+}
+
+// VerifyFrom walks a log that continues an existing chain, starting from a
+// known head hash and sequence number.
+//
+// This is what a rotated segment needs. Resume writes the continuation of a
+// chain into a fresh file, so that file's first record is sequence 4, or 4000,
+// and its Prev is whatever the previous segment ended on. Verify assumes
+// genesis and sequence zero, so it reports such a segment as BROKEN with
+// "sequence jumped from 0 to 4" — a correct answer to the wrong question.
+// Passing the previous segment's head and last sequence asks the right one.
+//
+// An empty head means genesis, matching Resume.
+func VerifyFrom(r io.Reader, head string, seq uint64) (VerifyResult, error) {
+	if head == "" {
+		head = GenesisHash
+	}
+	res := VerifyResult{OK: true, Head: head, LastSeq: seq}
 
 	// A bufio.Reader rather than a Scanner, because whether the final line
 	// carried its newline is the difference between a torn write and a
 	// tampered record, and a Scanner does not report it.
 	br := bufio.NewReaderSize(r, 64*1024)
 
-	var prev = GenesisHash
-	var lastSeq uint64
+	prev := head
+	lastSeq := seq
 
 	for {
 		raw, err := br.ReadString('\n')

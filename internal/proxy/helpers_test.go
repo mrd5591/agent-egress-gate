@@ -45,6 +45,9 @@ type gate struct {
 	server *httptest.Server
 	audit  *syncBuffer
 	reg    *prometheus.Registry
+	// handler is the Handler behind the server, so a test can reach the parts
+	// of the proxy that are not addressable over HTTP — Shutdown, above all.
+	handler *Handler
 }
 
 func (g *gate) URL() string { return g.server.URL }
@@ -132,6 +135,7 @@ func newGate(t *testing.T, pol *policy.Policy, cfg Config) *gate {
 	t.Helper()
 	g := &gate{audit: &syncBuffer{}, reg: prometheus.NewRegistry()}
 	h := New(policy.NewStore(pol), audit.New(g.audit), metrics.New(g.reg), cfg, nil)
+	g.handler = h
 	g.server = httptest.NewServer(h)
 	t.Cleanup(g.server.Close)
 	return g

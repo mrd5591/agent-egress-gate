@@ -137,6 +137,33 @@ chain BROKEN at record 2: record hash eebe75… does not match the recomputed ha
 1 records verified before the break
 ```
 
+Two flags exist because a chain that verifies is not by itself evidence.
+
+**`--min-records N`** fails a log that verifies but holds fewer than `N`
+records. An empty log verifies — `chain intact: 0 records`, exit 0 — so a CI
+job wired to the exit status cannot otherwise tell "nothing was recorded" from
+"everything verified", and a gate that was never in the traffic path reads as
+a healthy one. Where the caller knows traffic should have happened, it should
+say so:
+
+```bash
+./egressgate verify --audit audit.log --min-records 1
+```
+
+The default is 0, so a caller that says nothing gets exactly the old
+behaviour.
+
+**`--from-head HASH --from-seq N`** verify a rotated segment. `serve` continues
+an existing chain across restarts, so a segment written into a fresh file
+begins at neither the genesis hash nor sequence 1. Verified from the beginning,
+such a file reports `sequence jumped from 0 to 4` — a correct answer to the
+wrong question. Give it the head and sequence the previous segment ended on,
+which are the two numbers `serve` prints when it shuts down:
+
+```bash
+./egressgate verify --audit segment-2.log --from-head 508625… --from-seq 3
+```
+
 Some honest limits:
 
 - This is tamper **evidence**, not tamper resistance. Someone who can rewrite
@@ -154,6 +181,16 @@ Some honest limits:
   the Terraform module opens the admin port to nothing by default: until you
   pass `admin_ingress_security_group_ids`, no collector can scrape it and the
   window is genuinely unobserved.
+
+  A tunnel still open at shutdown is **not** lost, though, and that case is the
+  normal one: at the end of a CI job every tunnel is open when SIGTERM arrives.
+  `serve` closes the live tunnels, waits for each to write its record, and only
+  then prints the chain head — so the head it prints covers them. A CONNECT
+  arriving after shutdown has begun is answered `503` and audited as refused,
+  rather than opened where nothing would record it. Tunnels that have not
+  recorded within five seconds are abandoned with a message on stderr naming
+  how many; the alternative is a wedged tunnel holding the process open
+  forever.
 - **With `--audit <file>`,** a restart continues the existing chain rather than
   starting a new one, so a deploy does not look like tampering. This is the one
   bullet here that does not hold in the deployed configuration, which has no
@@ -296,6 +333,22 @@ Attach `agent_security_group_id` to your agent tasks and the gate stops being
 advice. IAM is scoped to the one log group, the one ECR repository and the one
 SSM parameter holding the policy, with no resource wildcards except the ECR
 authorization token, which has none to scope to.
+
+**Keep `upstream_ports` and the policy in step.** The gate's egress rules come
+from `var.upstream_ports`, which defaults to `[80, 443]`. A policy rule may
+name any port, and the two are not checked against each other: the policy lives
+in an SSM parameter the module deliberately never reads. So a rule naming, say,
+`8443` while `upstream_ports` is left at its default is accepted by the parser,
+evaluated as **allow**, audited as **allow**, and then dies as an unexplained
+upstream timeout — the security group refusing what the gate permitted, with
+nothing in the evidence log saying so. Widen a policy's ports, widen this
+variable.
+
+**The audit log group carries `prevent_destroy`.** Its name derives from
+`var.name`, so without the guard, renaming the module instance would delete the
+evidence artefact the product is built around as a side effect of a rename. The
+guard cannot be a variable — Terraform requires a literal there — so removing
+it on purpose means editing `main.tf`, which is the intent.
 
 One consequence worth stating before you hit it. Since Fargate platform 1.4.0
 a task's image pull goes through the task's own ENI and is therefore subject

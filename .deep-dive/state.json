@@ -1,15 +1,15 @@
 {
   "lastRunCommit": "817ce899a50cca7532645aac43475cca16bbc3ae",
-  "lastRunTimestamp": "2026-09-08T15:05:00Z",
-  "mode": "full",
-  "filesAnalyzed": 52,
-  "findingsCount": 61,
-  "note": "First deep-dive on this repo; establishing pass. Baseline was clean: 6/6 packages green, 93.2% coverage, golangci-lint 0 issues.",
+  "lastRunTimestamp": "2026-09-08T17:05:00Z",
+  "mode": "debt",
+  "filesAnalyzed": 16,
+  "findingsCount": 0,
+  "note": "Debt-burn pass: drained all ten open ledger entries. No review phase was run, so findingsCount/filesAnalyzed below describe the touched surface, not a fresh survey.",
   "coverageGaps": [
-    "The race detector was NOT run: this machine has no C compiler, so 'go test -race' fails to build and scripts/coverage.sh cannot run as CI runs it. Every concurrency conclusion this pass is source-reading, not observed behaviour. CI does run it.",
-    "terraform fmt/validate, tflint and govulncheck were NOT executed (not installed). All Terraform findings are from reading HCL.",
-    "Terraform has never been applied (no AWS account), and 'validate' does not inspect container_definitions at all. The container_definitions block was reviewed by hand only.",
-    "Signal handling (SIGINT/SIGTERM) was read, not exercised under a real signal: the host is Windows.",
-    "The docker container job WAS run locally and passed, including the new record-count assertions."
+    "go test -race was NOT run: this machine has no C compiler, so cgo is unavailable and -race requires it. Re-verified this pass rather than inherited. Every concurrency claim about the new tunnel-shutdown code is source-reading plus non-race test execution. CI runs it.",
+    "terraform fmt -check, init -backend=false and validate WERE run locally this pass against both the module and the example, all clean. This closes the standing 'Terraform never executed' gap. tflint and govulncheck remain CI-only (not installed).",
+    "Terraform has still never been applied (no AWS account). prevent_destroy, depends_on and the moved blocks are validated as configuration, not observed as behaviour.",
+    "Signal handling was still not exercised under a real signal (the host is Windows); the tunnel-drain path is covered by direct Handler.Shutdown tests instead, which is the part that carries the logic.",
+    "The tflint cache/retry CI change was not executed - it only runs on GitHub."
   ]
 }

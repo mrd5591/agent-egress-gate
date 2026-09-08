@@ -50,7 +50,7 @@ const usage = `egressgate - deny-by-default egress control for headless coding a
 
 Usage:
   egressgate serve  --policy FILE [--listen ADDR] [--admin ADDR] [--audit FILE]
-  egressgate verify --audit FILE
+  egressgate verify --audit FILE [--min-records N] [--from-head HASH --from-seq N]
   egressgate check  --policy FILE METHOD URL
 
 Commands:
@@ -62,6 +62,11 @@ Commands:
            and 3 when it verifies but the file does not end at a record
            boundary, which a crash can cause and a deliberate truncation
            looks identical to.
+           --min-records N fails a log that verifies but holds fewer than N
+           records, so a caller reading the exit status can tell "nothing was
+           recorded" from "everything verified".
+           --from-head HASH and --from-seq N verify a rotated segment, whose
+           chain continues an earlier file rather than starting at genesis.
   check    Ask what the policy would decide, without running anything.
            Exits 0 on allow and 1 on deny, so it works in a CI gate.
 `
@@ -259,6 +264,19 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 	serving.Store(false)
 	shutdown(dataSrv, adminSrv)
 
+	// Then the tunnels. http.Server.Shutdown deliberately does not wait on
+	// hijacked connections, so at this point every CONNECT tunnel is still
+	// running and none of them has written its record — a tunnel's record is
+	// written when it closes. Reading the head before this would print a head
+	// that the tunnels' own records then invalidate, and the tunnels open at
+	// SIGTERM, which at the end of a CI job is all of them, would never appear
+	// in the evidence at all.
+	tunnelCtx, tunnelCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := handler.Shutdown(tunnelCtx); err != nil {
+		fmt.Fprintf(stderr, "egressgate: %v\n", err)
+	}
+	tunnelCancel()
+
 	head, seq := auditLog.Head()
 	fmt.Fprintf(stderr, "audit chain head: %s after %d records\n", head, seq)
 	fmt.Fprintln(stderr, "record that hash somewhere the gate cannot write, or truncation of the log is undetectable")
@@ -431,12 +449,30 @@ func shutdown(servers ...*http.Server) {
 func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	fs := newFlagSet("verify", stderr)
 	auditPath := fs.String("audit", "", "path to the audit log (required)")
+	minRecords := fs.Int("min-records", 0,
+		"fail unless the log holds at least this many records; 0 accepts an empty log")
+	fromHead := fs.String("from-head", "",
+		"chain head this log continues from, for a rotated segment; empty means the log starts at genesis")
+	fromSeq := fs.Uint64("from-seq", 0,
+		"sequence number the previous segment ended on; used with --from-head")
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
 	if *auditPath == "" {
 		fmt.Fprintln(stderr, "egressgate: --audit is required")
 		fs.Usage()
+		return exitUsage
+	}
+	if *minRecords < 0 {
+		fmt.Fprintln(stderr, "egressgate: --min-records cannot be negative")
+		return exitUsage
+	}
+	// A sequence number without a head cannot be checked against anything: the
+	// chain would be verified from genesis while the sequence started
+	// elsewhere, which is a shape no writer produces. Saying so beats
+	// verifying something the caller did not mean.
+	if *fromHead == "" && *fromSeq != 0 {
+		fmt.Fprintln(stderr, "egressgate: --from-seq needs --from-head; a sequence offset without a head verifies nothing")
 		return exitUsage
 	}
 
@@ -448,7 +484,7 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 	}
 	defer func() { _ = f.Close() }()
 
-	res, err := audit.Verify(f)
+	res, err := audit.VerifyFrom(f, *fromHead, *fromSeq)
 	if err != nil {
 		fmt.Fprintf(stderr, "egressgate: %v\n", err)
 		return exitFail
@@ -462,6 +498,21 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "chain intact: %d records\n", res.Records)
 	fmt.Fprintf(stdout, "head: %s\n", res.Head)
+
+	// A log that verifies and holds nothing is the vacuous green: "chain
+	// intact: 0 records" exits 0, so a caller wired to the exit status cannot
+	// tell "nothing was recorded" from "everything verified". Where the caller
+	// knows traffic should have happened, --min-records is how it says so.
+	// This is checked before the truncation notes because a log too short to
+	// be evidence is a failure whatever shape its tail has.
+	if res.Records < *minRecords {
+		fmt.Fprintf(stdout,
+			"FAIL: %d records, but --min-records %d was required.\n"+
+				"  The chain verifies; there is just not enough of it. Either the gate saw no\n"+
+				"  traffic, or it was never in the path of the traffic it was supposed to gate.\n",
+			res.Records, *minRecords)
+		return exitFail
+	}
 	if res.TruncatedTail {
 		// The chain holds, but it stops mid-record, and a chain cannot tell a
 		// crash-truncated tail from one someone removed. That is the gap the
@@ -525,6 +576,32 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 	}
 
 	req := requestFor(u, method)
+
+	// The proxy refuses a non-normalising path with 400 before it consults the
+	// policy at all, so check has to do the same, in the same order, using the
+	// same code. It used to skip this and report the policy's answer, which
+	// meant `check GET http://h/allowed/../secret` said allow for a request
+	// the running gate rejects outright - the one direction check promises
+	// never to be wrong in.
+	//
+	// Only the plain-HTTP path has a path to normalise. A CONNECT tunnel
+	// carries no path, and requestFor has already modelled an https URL as
+	// one, so there is nothing to check there.
+	if req.Kind == policy.KindHTTP {
+		if norm, ok := proxy.NormalisedPath(u); !ok {
+			fmt.Fprintf(stdout, "%s %s\n", method, raw)
+			fmt.Fprintf(stdout, "  evaluated as: plain HTTP request to %s:%d\n", req.Host, req.Port)
+			fmt.Fprintf(stdout, "  decision:     refused\n")
+			fmt.Fprintf(stdout,
+				"  reason:       path %q contains dot-segments or encoded separators; it\n"+
+					"                normalises to %q, so a path rule could not be enforced on\n"+
+					"                what the upstream would route. The gate answers 400 without\n"+
+					"                consulting the policy.\n",
+				u.Path, norm)
+			return exitFail
+		}
+	}
+
 	decision := store.Evaluate(req)
 
 	kind := "plain HTTP request"

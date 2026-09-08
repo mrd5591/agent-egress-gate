@@ -38,8 +38,10 @@ func TestAppendChainsHashes(t *testing.T) {
 	if r1.Hash == "" {
 		t.Error("Hash is empty")
 	}
-	if r1.TS != "2026-09-08T14:02:11Z" {
-		t.Errorf("TS = %q, want the injected clock's time", r1.TS)
+	// Fixed-width nanoseconds, not time.RFC3339Nano's trimmed fraction: an
+	// evidence log has to sort lexicographically. See audit.TimeFormat.
+	if r1.TS != "2026-09-08T14:02:11.000000000Z" {
+		t.Errorf("TS = %q, want the injected clock's time at fixed width", r1.TS)
 	}
 
 	r2, err := l.Append(Record{Kind: "connect", Host: "b.com", Port: 443, Decision: "deny"})
@@ -86,6 +88,13 @@ func TestHashIsStableForAKnownRecord(t *testing.T) {
 	var buf bytes.Buffer
 	l := newTestLog(&buf)
 	r, err := l.Append(Record{
+		// TS is set explicitly, not left to the clock. The constant below was
+		// derived by hand from this exact pre-image, so the record it pins must
+		// not shift when the *default* timestamp layout changes: that layout is
+		// an output choice, while this is a statement about the hash function
+		// over a fixed set of bytes. Leaving it implicit once made a formatting
+		// change look like every existing log had become unverifiable.
+		TS:         "2026-09-08T14:02:11Z",
 		Kind:       "connect",
 		Method:     "GET",
 		Host:       "a&b.example.com",

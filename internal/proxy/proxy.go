@@ -8,6 +8,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,6 +61,39 @@ type Config struct {
 	// HTTP can still POST without bound. Read it as "one tunnel cannot consume
 	// the gate", not as "an agent cannot send more than this out".
 	MaxTunnelBytes int64
+
+	// The four fields below bound the plain-HTTP transport's connection pool.
+	// Each is zero-valued by default and zero means *unlimited* on
+	// http.Transport, unlike http.DefaultTransport which sets all but one of
+	// them. A gate that built its transport from a bare struct therefore held
+	// an idle socket open for every upstream it had ever contacted. New fills
+	// any of these left at zero from transportDefaults, so a caller that
+	// constructs a Config by hand still gets bounds.
+
+	// IdleConnTimeout is how long an idle keep-alive connection is retained.
+	IdleConnTimeout time.Duration
+	// MaxIdleConns caps idle connections across all upstreams.
+	MaxIdleConns int
+	// MaxConnsPerHost caps total connections to one upstream, in-flight and
+	// idle. DefaultTransport leaves this unlimited; the gate does not, because
+	// one agent looping on one host should not be able to exhaust the gate's
+	// file descriptors.
+	MaxConnsPerHost int
+	// TLSHandshakeTimeout bounds the TLS handshake with an upstream.
+	TLSHandshakeTimeout time.Duration
+}
+
+// transportDefaults are the connection-pool bounds applied to any Config field
+// left at zero. The first, second and fourth mirror http.DefaultTransport.
+// MaxConnsPerHost has no DefaultTransport value to mirror — DefaultTransport
+// leaves it unlimited — so it is chosen here: high enough that ordinary
+// parallel CI fetches never queue, low enough to bound the damage from a
+// runaway client.
+var transportDefaults = Config{
+	IdleConnTimeout:     90 * time.Second,
+	MaxIdleConns:        100,
+	MaxConnsPerHost:     64,
+	TLSHandshakeTimeout: 10 * time.Second,
 }
 
 // DefaultConfig returns timeouts suitable for CI traffic: generous enough for
@@ -70,7 +105,34 @@ func DefaultConfig() Config {
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleTimeout:           5 * time.Minute,
 		MaxTunnelBytes:        0,
+
+		IdleConnTimeout:     transportDefaults.IdleConnTimeout,
+		MaxIdleConns:        transportDefaults.MaxIdleConns,
+		MaxConnsPerHost:     transportDefaults.MaxConnsPerHost,
+		TLSHandshakeTimeout: transportDefaults.TLSHandshakeTimeout,
 	}
+}
+
+// withTransportDefaults fills any connection-pool bound left at zero.
+//
+// This is applied in New rather than left to the caller because zero means
+// unlimited on http.Transport. A caller assembling a Config field by field —
+// which cmd/egressgate does, from its flags — would otherwise silently opt out
+// of every bound by not mentioning it.
+func withTransportDefaults(cfg Config) Config {
+	if cfg.IdleConnTimeout == 0 {
+		cfg.IdleConnTimeout = transportDefaults.IdleConnTimeout
+	}
+	if cfg.MaxIdleConns == 0 {
+		cfg.MaxIdleConns = transportDefaults.MaxIdleConns
+	}
+	if cfg.MaxConnsPerHost == 0 {
+		cfg.MaxConnsPerHost = transportDefaults.MaxConnsPerHost
+	}
+	if cfg.TLSHandshakeTimeout == 0 {
+		cfg.TLSHandshakeTimeout = transportDefaults.TLSHandshakeTimeout
+	}
+	return cfg
 }
 
 // Handler is the proxy. It implements http.Handler so it can be served by an
@@ -83,6 +145,24 @@ type Handler struct {
 	log       *slog.Logger
 	transport *http.Transport
 	dialer    *net.Dialer
+
+	// Live CONNECT tunnels, so Shutdown can end them and collect their audit
+	// records. A tunnel's record is written when the tunnel closes, so without
+	// this a tunnel open at SIGTERM — the normal case at the end of a CI job —
+	// leaves no trace at all: http.Server.Shutdown does not wait on hijacked
+	// connections, and nothing else was tracking them.
+	tunnelMu     sync.Mutex
+	tunnels      map[uint64]tunnelConns
+	nextTunnelID uint64
+	closing      bool
+	tunnelWG     sync.WaitGroup
+}
+
+// tunnelConns is both ends of one hijacked tunnel. Closing either unblocks the
+// copy goroutines in pump, which is how a tunnel is ended from outside.
+type tunnelConns struct {
+	client   net.Conn
+	upstream net.Conn
 }
 
 // New builds a Handler. A nil logger falls back to the default slog logger.
@@ -90,6 +170,7 @@ func New(e Evaluator, a Auditor, m *metrics.Metrics, cfg Config, logger *slog.Lo
 	if logger == nil {
 		logger = slog.Default()
 	}
+	cfg = withTransportDefaults(cfg)
 	dialer := &net.Dialer{Timeout: cfg.DialTimeout}
 	return &Handler{
 		eval:    e,
@@ -103,8 +184,112 @@ func New(e Evaluator, a Auditor, m *metrics.Metrics, cfg Config, logger *slog.Lo
 			ResponseHeaderTimeout: cfg.ResponseHeaderTimeout,
 			Proxy:                 nil, // the gate is the proxy; it must not chain to another
 			ForceAttemptHTTP2:     false,
+			IdleConnTimeout:       cfg.IdleConnTimeout,
+			MaxIdleConns:          cfg.MaxIdleConns,
+			MaxConnsPerHost:       cfg.MaxConnsPerHost,
+			TLSHandshakeTimeout:   cfg.TLSHandshakeTimeout,
 		},
 	}
+}
+
+// registerTunnel records a hijacked tunnel so Shutdown can end it and wait for
+// its audit record. It reports false when the gate is already shutting down,
+// in which case the caller must not start the tunnel at all.
+//
+// The refusal is what closes the race. Registration and the closing flag share
+// one mutex, so a tunnel either registers before Shutdown snapshots the set —
+// and is therefore closed and waited for — or is refused outright. Neither
+// order leaves a tunnel running that nobody is waiting on.
+//
+// The returned function unregisters and releases the wait. It must run *after*
+// the record is written, which a deferred call in handleConnect achieves:
+// deferred calls run after the function body, and the body is what calls
+// finish.
+func (h *Handler) registerTunnel(client, upstream net.Conn) (unregister func(), ok bool) {
+	h.tunnelMu.Lock()
+	defer h.tunnelMu.Unlock()
+
+	if h.closing {
+		return nil, false
+	}
+	if h.tunnels == nil {
+		h.tunnels = make(map[uint64]tunnelConns)
+	}
+	h.nextTunnelID++
+	id := h.nextTunnelID
+	h.tunnels[id] = tunnelConns{client: client, upstream: upstream}
+	h.tunnelWG.Add(1)
+
+	return func() {
+		h.tunnelMu.Lock()
+		delete(h.tunnels, id)
+		h.tunnelMu.Unlock()
+		h.tunnelWG.Done()
+	}, true
+}
+
+// Shutdown ends every live CONNECT tunnel and waits until each has written its
+// audit record, or until ctx expires.
+//
+// Call it after http.Server.Shutdown and before reading the audit chain head.
+// http.Server.Shutdown deliberately does not wait on hijacked connections, so
+// it returns while tunnels are still running; reading the head at that point
+// prints a head that later records invalidate, and the tunnels themselves are
+// never audited.
+//
+// After Shutdown no new tunnel starts: a CONNECT arriving in the gap answers
+// 503 and is audited as such, which is a truthful record rather than a missing
+// one.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	h.tunnelMu.Lock()
+	h.closing = true
+	live := make([]tunnelConns, 0, len(h.tunnels))
+	for _, c := range h.tunnels {
+		live = append(live, c)
+	}
+	h.tunnelMu.Unlock()
+
+	// Closing both ends unblocks pump's copies, so each handleConnect returns
+	// and writes its record through the ordinary path. Nothing here writes a
+	// record itself: a shutdown record assembled out here would carry byte
+	// counts nobody had finished counting.
+	for _, c := range live {
+		_ = c.client.Close()
+		_ = c.upstream.Close()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		h.tunnelWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		h.tunnelMu.Lock()
+		stranded := len(h.tunnels)
+		h.tunnelMu.Unlock()
+		return fmt.Errorf(
+			"proxy: %d tunnel(s) had not written an audit record when the shutdown deadline passed: %w",
+			stranded, ctx.Err())
+	}
+}
+
+// isClosing reports whether Shutdown has begun.
+func (h *Handler) isClosing() bool {
+	h.tunnelMu.Lock()
+	defer h.tunnelMu.Unlock()
+	return h.closing
+}
+
+// activeTunnels reports how many tunnels are registered. It exists for tests;
+// the exported view of the same number is the egressgate_active_tunnels gauge.
+func (h *Handler) activeTunnels() int {
+	h.tunnelMu.Lock()
+	defer h.tunnelMu.Unlock()
+	return len(h.tunnels)
 }
 
 // hopByHopHeaders are defined per-connection by RFC 7230 section 6.1 and must
@@ -282,6 +467,17 @@ func (h *Handler) finish(rec *audit.Record, start time.Time, status int) {
 	if rec.BytesDown > 0 {
 		h.metrics.Bytes.WithLabelValues("down").Add(float64(rec.BytesDown))
 	}
+}
+
+// NormalisedPath is normalisedPath, exported so that anything modelling the
+// gate's answer uses the gate's own code rather than a copy of it.
+//
+// `egressgate check` is the caller that needs it. A copy would drift, and the
+// drift already happened once: check reported allow for a path the running
+// proxy refuses with 400, contradicting its documented promise never to
+// promise an allow the gate would refuse.
+func NormalisedPath(u *url.URL) (normalised string, ok bool) {
+	return normalisedPath(u)
 }
 
 // normalisedPath reports the cleaned form of a request path and whether it is

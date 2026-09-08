@@ -48,6 +48,20 @@ resource "aws_cloudwatch_log_group" "gate" {
   # group it lands in is cheap and on-message.
   kms_key_id = var.log_group_kms_key_arn
   tags       = var.tags
+
+  # The name derives from var.name, so renaming the module instance would
+  # otherwise destroy and recreate this group - silently deleting the evidence
+  # the whole product is built around, as a side effect of a rename nobody
+  # thought of as destructive.
+  #
+  # This is deliberately not governed by a variable: Terraform requires a
+  # literal here and rejects any expression, including a var reference. Taking
+  # the guard off is therefore an edit to this file, which is the point. To
+  # remove the group on purpose, delete this block in its own commit, apply,
+  # and put it back.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_ecs_cluster" "gate" {
@@ -149,6 +163,13 @@ resource "aws_ecs_service" "gate" {
   launch_type            = "FARGATE"
   enable_execute_command = false
   tags                   = var.tags
+
+  # The task definition references the execution *role*, which gives Terraform
+  # an implicit edge to that role but none to the inline policy attached to it.
+  # Without this the service can start tasks before the policy exists: the
+  # image pull or GetParameters then fails, the deployment circuit breaker
+  # trips, and a correct configuration looks like a broken one.
+  depends_on = [aws_iam_role_policy.execution]
 
   network_configuration {
     subnets = var.private_subnet_ids
