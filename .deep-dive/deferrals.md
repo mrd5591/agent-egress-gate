@@ -31,28 +31,6 @@ and every other caller inherits it.
 (default 0, so today's behaviour is unchanged) and use it wherever a caller
 knows traffic should have occurred.
 
-### `money` · own-pr · run 1 — Chain continuity is unachievable in the shipped config
-Resuming needs a file to read back, so it never happens under the default
-stdout sink; the ECS task definition passes no `--audit`, so every restart
-starts a new chain at sequence 1, and `desired_count` defaults to 2, so two
-chains run at once. Documented honestly in the README this pass, but the
-property the audit chain exists to provide is not actually delivered by the
-deployment.
-**Design gate.** Default if nobody rules by run 3: leave it documented and do
-not build cross-restart continuity — the alternative (threading the head
-through SSM or a sidecar) is a larger product than this one.
-
-### `money` · small · run 1 — CloudWatch stream is not directly verifiable
-The `awslogs` driver merges the container's stderr into the same stream as the
-audit records on stdout, so the deployed log does not parse as one JSON object
-per line. Reproduced: `chain BROKEN at record 1: could not decode record:
-invalid character 'l'` — the `l` of the `listening:` startup line. Documented
-this pass; the CI `container` job cannot see it because `docker logs` keeps the
-streams apart.
-**Design gate.** Default if nobody rules by run 3: ship a documented extraction
-one-liner in the README rather than adding a quiet mode, since the diagnostics
-on stderr are worth keeping.
-
 ### `money` · small · run 1 — Audit log group can be destroyed silently
 `aws_cloudwatch_log_group.gate` has no `prevent_destroy`, and its name derives
 from `var.name`, so renaming the module instance deletes the evidence artefact
