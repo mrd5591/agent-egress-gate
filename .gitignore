@@ -6,5 +6,4 @@ coverage.*
 .terraform/
 *.tfstate
 *.tfstate.*
-.terraform.lock.hcl
 audit.log
