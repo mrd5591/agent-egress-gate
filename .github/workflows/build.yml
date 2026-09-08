@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A superseded push should not keep burning runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   go:
     runs-on: ${{ matrix.os }}
@@ -83,10 +88,63 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25"
+      # Pinned, for the same reason the Terraform provider is pinned: an
+      # unpinned tool is one that works today and fails later for reasons
+      # nobody wrote down.
       - name: govulncheck
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
+
+  # The container is the artefact the Terraform actually runs, and nothing was
+  # exercising it. That is how a task definition passing a shell invocation to
+  # an image with an ENTRYPOINT survived to code review: `terraform validate`
+  # cannot see inside container_definitions, and no job ever started the
+  # image. This job runs the container the way ECS does and drives traffic
+  # through it.
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build the image
+        run: docker build -t egressgate:ci .
+
+      - name: Run it the way the task definition does
+        run: |
+          set -euo pipefail
+
+          docker run --rm -d --name egci --read-only \
+            -e EGRESSGATE_POLICY="$(cat policy.example.yaml)" \
+            -p 18080:8080 -p 19090:9090 \
+            egressgate:ci \
+            serve --policy-env EGRESSGATE_POLICY \
+                  --listen 0.0.0.0:8080 --admin 0.0.0.0:9090
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19090/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:19090/healthz
+
+          # An allowed host tunnels, a denied host is refused.
+          allowed="$(curl -s -o /dev/null -w '%{http_code}' --proxy http://127.0.0.1:18080 https://pypi.org/simple/ || true)"
+          denied="$(curl -s -o /dev/null -w '%{http_code}' --proxy http://127.0.0.1:18080 http://example.com/ || true)"
+          echo "allowed=$allowed denied=$denied"
+          test "$allowed" = "200"
+          test "$denied" = "403"
+
+          # stdout must be audit records and nothing else, because that is what
+          # the awslogs driver collects and what `verify` has to read.
+          docker logs egci 2>/dev/null > container-audit.log
+          docker rm -f egci >/dev/null
+
+          go build -o egressgate ./cmd/egressgate
+          ./egressgate verify --audit container-audit.log
 
   terraform:
     runs-on: ubuntu-latest

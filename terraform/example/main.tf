@@ -117,6 +117,59 @@ resource "aws_ssm_parameter" "policy" {
   value = file("${path.module}/policy.yaml")
 }
 
+# An agent task can only reach the gate, so it cannot pull its own image from
+# the internet. These endpoints keep that traffic inside the VPC. Without them
+# the strict security group is correct and the agent never starts.
+resource "aws_security_group" "endpoints" {
+  name_prefix = "${local.name}-endpoints-"
+  description = "Interface VPC endpoints for ECR and CloudWatch Logs"
+  vpc_id      = aws_vpc.this.id
+  tags        = local.tags
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "endpoints_from_vpc" {
+  security_group_id = aws_security_group.endpoints.id
+  cidr_ipv4         = local.vpc_cidr
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  description       = "HTTPS from inside the VPC"
+  tags              = local.tags
+}
+
+resource "aws_vpc_endpoint" "interface" {
+  for_each = toset(["ecr.api", "ecr.dkr", "logs"])
+
+  vpc_id              = aws_vpc.this.id
+  service_name        = "com.amazonaws.${var.region}.${each.value}"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = aws_subnet.private[*].id
+  security_group_ids  = [aws_security_group.endpoints.id]
+  private_dns_enabled = true
+  tags                = merge(local.tags, { Name = "${local.name}-${each.value}" })
+}
+
+# ECR image layers live in S3, which is reached through a gateway endpoint.
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = aws_vpc.this.id
+  service_name      = "com.amazonaws.${var.region}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = [aws_route_table.private.id]
+  tags              = merge(local.tags, { Name = "${local.name}-s3" })
+}
+
+# Service Connect gives the gate a stable name, so agents have something to
+# put in HTTP_PROXY.
+resource "aws_service_discovery_http_namespace" "this" {
+  name        = local.name
+  description = "Service Connect namespace for the egress gate"
+  tags        = local.tags
+}
+
 module "egress_gate" {
   source = "../modules/egress-gate"
 
@@ -126,4 +179,14 @@ module "egress_gate" {
   policy_parameter_arn = aws_ssm_parameter.policy.arn
   image                = var.image
   tags                 = local.tags
+
+  vpc_endpoint_security_group_ids = [aws_security_group.endpoints.id]
+  s3_gateway_prefix_list_id       = aws_vpc_endpoint.s3.prefix_list_id
+
+  enable_service_connect        = true
+  service_connect_namespace_arn = aws_service_discovery_http_namespace.this.arn
+
+  # So `terraform destroy` on an example people are meant to try does not
+  # fail on a repository that still holds an image.
+  ecr_force_delete = true
 }

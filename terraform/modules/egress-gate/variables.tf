@@ -68,6 +68,82 @@ variable "admin_ingress_security_group_ids" {
   default     = []
 }
 
+variable "vpc_endpoint_security_group_ids" {
+  description = <<-EOT
+    Security groups of the interface VPC endpoints for ECR (api and dkr) and
+    CloudWatch Logs. Agent tasks are given egress to these on 443 so they can
+    pull their image and ship logs without reaching the internet.
+
+    Leaving this empty produces the strictest configuration, in which an agent
+    task on Fargate platform 1.4.0 or later cannot pull its image and will not
+    start. See the README.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
+variable "s3_gateway_prefix_list_id" {
+  description = <<-EOT
+    Prefix list id of the S3 gateway endpoint, where ECR stores image layers.
+    Null omits the rule, with the same consequence as an empty
+    vpc_endpoint_security_group_ids.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "enable_service_connect" {
+  description = <<-EOT
+    Register the gate in an ECS Service Connect namespace so agents can reach
+    it by a stable DNS name instead of a task IP. Requires
+    service_connect_namespace_arn.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "service_connect_namespace_arn" {
+  description = "Cloud Map namespace ARN used when enable_service_connect is true."
+  type        = string
+  default     = null
+}
+
+variable "service_connect_dns_name" {
+  description = "DNS name agents will use for the gate within the namespace."
+  type        = string
+  default     = "egress-gate"
+}
+
+variable "log_group_kms_key_arn" {
+  description = <<-EOT
+    KMS key for the CloudWatch log group that carries the audit log. Null uses
+    the CloudWatch default encryption.
+  EOT
+  type        = string
+  default     = null
+}
+
+variable "ecr_keep_images" {
+  description = "How many images the ECR lifecycle policy retains."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.ecr_keep_images >= 1
+    error_message = "At least one image must be retained."
+  }
+}
+
+variable "ecr_force_delete" {
+  description = <<-EOT
+    Allow terraform destroy to remove the ECR repository even when it still
+    holds images. Convenient for the example; leave false in production, where
+    losing image history to a destroy is a bad trade.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "policy_parameter_arn" {
   description = <<-EOT
     ARN of the SSM parameter holding the policy YAML. The task role is granted

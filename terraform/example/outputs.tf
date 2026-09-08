@@ -8,9 +8,9 @@ output "ecr_repository_url" {
   value       = module.egress_gate.ecr_repository_url
 }
 
-output "proxy_endpoint_hint" {
-  description = "Set HTTP_PROXY and HTTPS_PROXY on the agent to the gate's task address on this port."
-  value       = "http://<gate-task-ip>:${module.egress_gate.proxy_port}"
+output "proxy_endpoint" {
+  description = "Set HTTP_PROXY and HTTPS_PROXY on agent tasks to this."
+  value       = module.egress_gate.proxy_endpoint
 }
 
 output "log_group_name" {

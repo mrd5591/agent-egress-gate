@@ -10,10 +10,14 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/egressgate ./cmd/egressgate
 
-# Runtime. Alpine rather than distroless because the ECS task definition uses
-# a shell to materialise the policy file and wget for its health check. Trading
-# a slightly larger attack surface for a health check that actually runs is the
-# right way round; a container nobody can probe is not safer.
+# Runtime. Alpine rather than distroless for wget, which the ECS health check
+# uses. Trading a slightly larger attack surface for a health check that
+# actually runs is the right way round; a container nobody can probe is not
+# safer.
+#
+# The gate reads its policy from a file or from the environment and writes its
+# audit log to stdout, so it needs nothing writable. The task definition runs
+# it with a read-only root filesystem.
 FROM alpine:3.20
 
 RUN apk add --no-cache ca-certificates \

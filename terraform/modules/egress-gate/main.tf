@@ -1,10 +1,14 @@
 locals {
   container_name = "${var.name}-gate"
+  # Service Connect addresses a port by name, so the port mapping must carry
+  # one.
+  proxy_port_name = "proxy"
 }
 
 resource "aws_ecr_repository" "gate" {
   name                 = var.name
   image_tag_mutability = "IMMUTABLE"
+  force_delete         = var.ecr_force_delete
   tags                 = var.tags
 
   image_scanning_configuration {
@@ -16,10 +20,34 @@ resource "aws_ecr_repository" "gate" {
   }
 }
 
+# Immutable tags mean every build adds an image and none is ever replaced, so
+# without this the repository grows without bound.
+resource "aws_ecr_lifecycle_policy" "gate" {
+  repository = aws_ecr_repository.gate.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep the last ${var.ecr_keep_images} images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = var.ecr_keep_images
+        }
+        action = { type = "expire" }
+      },
+    ]
+  })
+}
+
 resource "aws_cloudwatch_log_group" "gate" {
   name              = "/ecs/${var.name}"
   retention_in_days = var.log_retention_days
-  tags              = var.tags
+  # The audit log lands here, and it is the evidence artefact. Encrypting the
+  # group it lands in is cheap and on-message.
+  kms_key_id = var.log_group_kms_key_arn
+  tags       = var.tags
 }
 
 resource "aws_ecs_cluster" "gate" {
@@ -49,8 +77,8 @@ resource "aws_ecs_task_definition" "gate" {
       essential = true
 
       # The policy arrives as an environment variable read from SSM, and the
-      # entrypoint writes it to a file before starting. Keeping the policy out
-      # of the image means changing it does not mean rebuilding.
+      # gate parses it directly. Keeping the policy out of the image means
+      # changing it does not mean rebuilding.
       secrets = [
         {
           name      = "EGRESSGATE_POLICY"
@@ -58,19 +86,24 @@ resource "aws_ecs_task_definition" "gate" {
         },
       ]
 
+      # These are arguments to the image's ENTRYPOINT, not a replacement for
+      # it: ECS `command` maps to Docker's Cmd, which is appended to
+      # Entrypoint rather than overriding it. An earlier version of this file
+      # passed a shell invocation here, which produced
+      # `egressgate sh -c ...` and exited immediately.
+      #
+      # Reading the policy from the environment is what removes the shell,
+      # which in turn is what allows a read-only root filesystem below.
       command = [
-        "sh", "-c",
-        join(" ", [
-          "printf '%s' \"$EGRESSGATE_POLICY\" > /tmp/policy.yaml &&",
-          "exec /usr/local/bin/egressgate serve",
-          "--policy /tmp/policy.yaml",
-          "--listen 0.0.0.0:${var.proxy_port}",
-          "--admin 0.0.0.0:${var.admin_port}",
-        ])
+        "serve",
+        "--policy-env", "EGRESSGATE_POLICY",
+        "--listen", "0.0.0.0:${var.proxy_port}",
+        "--admin", "0.0.0.0:${var.admin_port}",
       ]
 
       portMappings = [
         {
+          name          = local.proxy_port_name
           containerPort = var.proxy_port
           protocol      = "tcp"
         },
@@ -92,7 +125,9 @@ resource "aws_ecs_task_definition" "gate" {
         }
       }
 
-      readonlyRootFilesystem = false # the entrypoint writes /tmp/policy.yaml
+      # The gate writes nothing to disk: the policy comes from the
+      # environment and the audit log goes to stdout.
+      readonlyRootFilesystem = true
       user                   = "65532:65532"
 
       healthCheck = {
@@ -129,6 +164,30 @@ resource "aws_ecs_service" "gate" {
   deployment_circuit_breaker {
     enable   = true
     rollback = true
+  }
+
+  # Without this the gate has no stable address: awsvpc tasks get ephemeral
+  # private IPs, and desired_count is above one. Service Connect gives agents
+  # a name to put in HTTP_PROXY. DNS resolution is unaffected by the agent's
+  # single egress rule, because security groups do not filter the VPC
+  # resolver.
+  dynamic "service_connect_configuration" {
+    for_each = var.enable_service_connect ? [1] : []
+
+    content {
+      enabled   = true
+      namespace = var.service_connect_namespace_arn
+
+      service {
+        port_name      = local.proxy_port_name
+        discovery_name = var.service_connect_dns_name
+
+        client_alias {
+          port     = var.proxy_port
+          dns_name = var.service_connect_dns_name
+        }
+      }
+    }
   }
 }
 

@@ -77,13 +77,57 @@ resource "aws_vpc_security_group_egress_rule" "gate_to_internet_http" {
   tags              = var.tags
 }
 
-# The one and only outbound rule an agent task gets.
+# The agent's only route to anything outside the VPC.
 resource "aws_vpc_security_group_egress_rule" "agent_to_gate_only" {
   security_group_id            = aws_security_group.agent.id
   referenced_security_group_id = aws_security_group.gate.id
   from_port                    = var.proxy_port
   to_port                      = var.proxy_port
   ip_protocol                  = "tcp"
-  description                  = "The only outbound rule an agent task has"
+  description                  = "The agent's only route out of the VPC"
   tags                         = var.tags
 }
+
+# Fargate platform version 1.4.0 moved the image pull and the ECS agent's own
+# calls onto the task ENI, so they are subject to the task's security group. A
+# task whose only egress rule is the one above cannot pull its image and never
+# starts.
+#
+# The fix is not to open the internet: it is to let the task reach the VPC
+# endpoints for ECR, CloudWatch Logs and S3, which stay inside the VPC.
+# Arbitrary egress still has exactly one route, through the gate.
+#
+# Both variables default to empty, so a caller who has not created endpoints
+# gets the strict configuration and the README's caveat explains why the task
+# will not start without them.
+resource "aws_vpc_security_group_egress_rule" "agent_to_vpc_endpoints" {
+  for_each = toset(var.vpc_endpoint_security_group_ids)
+
+  security_group_id            = aws_security_group.agent.id
+  referenced_security_group_id = each.value
+  from_port                    = 443
+  to_port                      = 443
+  ip_protocol                  = "tcp"
+  description                  = "Interface endpoints for ECR and CloudWatch Logs, so the task can start"
+  tags                         = var.tags
+}
+
+# S3 is reached through a gateway endpoint, which is addressed by prefix list
+# rather than by security group. ECR image layers live in S3.
+resource "aws_vpc_security_group_egress_rule" "agent_to_s3_gateway" {
+  count = var.s3_gateway_prefix_list_id == null ? 0 : 1
+
+  security_group_id = aws_security_group.agent.id
+  prefix_list_id    = var.s3_gateway_prefix_list_id
+  from_port         = 443
+  to_port           = 443
+  ip_protocol       = "tcp"
+  description       = "S3 gateway endpoint, where ECR image layers are stored"
+  tags              = var.tags
+}
+
+# The gate resolves upstream hostnames through the VPC resolver at VPC+2.
+# Security groups do not filter traffic to the Route 53 Resolver, which is why
+# no DNS egress rule appears here. That stops being true if the VPC uses a
+# custom DHCP options set pointing at a private forwarder, in which case this
+# module needs an egress rule for it.

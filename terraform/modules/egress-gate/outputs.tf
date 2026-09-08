@@ -35,3 +35,12 @@ output "proxy_port" {
   description = "Port agents should send proxy traffic to."
   value       = var.proxy_port
 }
+
+output "proxy_endpoint" {
+  description = <<-EOT
+    Value to put in HTTP_PROXY and HTTPS_PROXY on agent tasks. Null unless
+    Service Connect is enabled, because without it the gate has no stable
+    address: awsvpc tasks get ephemeral private IPs and there is more than one.
+  EOT
+  value       = var.enable_service_connect ? "http://${var.service_connect_dns_name}:${var.proxy_port}" : null
+}

@@ -156,9 +156,14 @@ can reload the policy can replace the policy that constrains it.
 Point the agent at it:
 
 ```bash
-export HTTP_PROXY=http://gate:8080
-export HTTPS_PROXY=http://gate:8080
+export HTTP_PROXY=http://egress-gate:8080
+export HTTPS_PROXY=http://egress-gate:8080
 ```
+
+That hostname comes from ECS Service Connect, which the module enables when
+you give it a namespace. Without it the gate has no stable address, because
+tasks get ephemeral private IPs and there is more than one of them; the
+module's `proxy_endpoint` output is null in that case rather than guessing.
 
 A policy reload reads and parses before it swaps, so a typo leaves the
 previous policy in force rather than briefly opening the gate:
@@ -182,34 +187,65 @@ advice. IAM is scoped to the one log group, the one ECR repository and the one
 SSM parameter holding the policy, with no resource wildcards except the ECR
 authorization token, which has none to scope to.
 
+One consequence worth stating before you hit it. Since Fargate platform 1.4.0
+a task's image pull goes through the task's own ENI and is therefore subject
+to its security group, so a task whose only egress rule is "reach the gate"
+cannot pull its image and never starts. The module takes
+`vpc_endpoint_security_group_ids` and `s3_gateway_prefix_list_id` and opens
+443 to those, which keeps that traffic inside the VPC. Leave them empty and
+you get the strictest rules and a task that will not launch. The example wires
+up the endpoints so it is a configuration that would actually run.
+
 `terraform/example` stands up a VPC, a NAT gateway, the parameter and the
 module, so `validate` runs against a real caller.
 
 **Validated, not applied.** CI runs `fmt -check`, `init -backend=false`,
 `validate` and `tflint` on every push. It has never run `apply`, because there
-is no AWS account attached to this repository. The configuration is
-syntactically valid and type-checked against the AWS provider schema; it has
-not been proven to converge against the live API. Treat it as a reviewed
-starting point, not as something known to stand up on the first try.
+is no AWS account attached to this repository.
+
+Be precise about what that buys. `validate` checks the resource arguments and
+their types against the provider schema. It does **not** check
+`container_definitions`, which Terraform sees as an opaque JSON string, and
+that block is the most important one in the module: the command, the user, the
+read-only root filesystem and the health check all live inside it and get zero
+checking. That gap is exactly how an earlier version shipped a task definition
+passing a shell invocation to an image with an `ENTRYPOINT`, which would have
+started no container at all. The `container` CI job now runs the image the way
+the task definition does and drives real traffic through it, which is what
+actually covers that block. The rest remains a reviewed starting point, not
+something known to converge on the first apply.
 
 ## Building the container
 
 ```bash
 docker build -t egressgate .
 
+# A policy file mounted in:
 docker run --rm -p 8080:8080 -p 9090:9090 \
   -v "$(pwd)/policy.example.yaml:/etc/egressgate/policy.yaml:ro" \
   egressgate
+
+# Or the policy in the environment, with a read-only root filesystem. This is
+# how the ECS task definition runs it: no shell, and no writable path anywhere
+# in the container.
+docker run --rm --read-only -p 8080:8080 -p 9090:9090 \
+  -e EGRESSGATE_POLICY="$(cat policy.example.yaml)" \
+  egressgate serve --policy-env EGRESSGATE_POLICY \
+    --listen 0.0.0.0:8080 --admin 0.0.0.0:9090
 ```
 
-Static binary, non-root user (uid 65532), Alpine base. Alpine rather than
-distroless because the ECS task definition uses a shell to write the policy
-file and `wget` for its health check.
+Static binary, non-root user (uid 65532), read-only root filesystem, Alpine
+base. Alpine rather than distroless only for `wget`, which the ECS health check
+uses. The container needs no shell: reading the policy from the environment is
+what removed it.
 
-Unlike the Terraform, this path **has** been run: the image was built, started
-with the example policy mounted, and driven with real traffic. An allowed host
-returned 200 through the tunnel, a denied host returned 403, and the audit log
-appeared on stdout, which is where the ECS `awslogs` driver picks it up.
+Unlike the Terraform, this path **has** been run, and CI runs it on every push.
+The `container` job builds the image, starts it read-only exactly as the task
+definition does, checks that an allowed host returns 200 through the tunnel and
+a denied host returns 403, then pipes the container's stdout into `egressgate
+verify`. That last step is the one that matters: stdout is the default audit
+sink, so it has to carry audit records and nothing else, or the verifier cannot
+read the log the deployment actually produces.
 
 ## Development
 
@@ -218,12 +254,48 @@ go test ./... -race          # every test runs under the race detector
 ./scripts/coverage.sh        # same coverage floor CI uses
 ```
 
-Test-driven throughout: 93% statement coverage, and the uncovered remainder is
+Test-driven throughout: 94% statement coverage, and the uncovered remainder is
 listed in the code with the reason it cannot be reached. The tests that carry
 the most weight are the ones asserting a denied request **never reaches the
 upstream**, rather than merely that the client saw a 403. A proxy that
 forwards first and reports 403 afterwards passes the weaker test and provides
 no containment at all.
+
+## Threat model
+
+Who this stops, and who it does not.
+
+**It stops** an agent that follows its `HTTP_PROXY` setting from reaching an
+unlisted host, and an agent that ignores that setting from reaching anything at
+all, because the security group leaves it exactly one route. It records every
+decision somewhere the task itself cannot rewrite, and makes a later edit to
+that record detectable.
+
+**It does not stop** someone who compromises the gate task. That process holds
+the policy, terminates the tunnels and writes the log. It is the trust
+boundary, not something defended behind one. Run it in its own subnet, give it
+no role it does not need (the task role here grants nothing at all), and treat
+its image with the care you would give a bastion.
+
+**The admin plane is separated by placement, not authenticated.** Anything that
+can reach the admin port can read the metrics and reload the policy from its
+file. That is a security-group boundary, so a mistake in those rules is a real
+exposure rather than a second line to get past. Version one takes that trade
+deliberately, and it is the first thing to change if the gate ever runs
+somewhere less controlled.
+
+**DNS is outside the boundary.** A rule names a host; resolution belongs to the
+resolver. A poisoned resolver defeats a hostname allowlist here as everywhere.
+The gate also reaches the VPC resolver without an egress rule, because security
+groups do not filter that traffic. A VPC with a custom DHCP options set
+pointing at a private forwarder would need a rule this module does not write.
+
+**The example VPC gives agents a NAT route.** Both private subnets share one
+route table with a default route to the NAT gateway, so only the security group
+stands between an agent and the internet. That is why the agent group's single
+egress rule carries so much weight. A stricter build would put agents in a
+subnet with no default route at all, leaving a misconfigured group nowhere to
+go.
 
 ## What this does not do
 

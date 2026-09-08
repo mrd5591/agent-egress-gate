@@ -1,0 +1,22 @@
+# Without this, a working tree where anyone has run `terraform init` sends
+# over a gigabyte of cached provider binaries to the Docker daemon and busts
+# the layer cache on every source change.
+.terraform/
+**/.terraform/
+*.tfstate
+*.tfstate.*
+
+.git/
+.github/
+.claude/
+
+docs/
+README.md
+LICENSE
+
+coverage.out
+coverage.html
+*audit.log
+/egressgate
+/egressgate.exe
+/dist/
