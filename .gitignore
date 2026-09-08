@@ -1,0 +1,10 @@
+/egressgate
+/egressgate.exe
+/dist/
+*.out
+coverage.*
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+audit.log
