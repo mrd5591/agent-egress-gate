@@ -245,7 +245,9 @@ func TestServeStartsProxiesAndShutsDownCleanly(t *testing.T) {
 		done <- result{code, out.String(), errOut.String()}
 	}()
 
-	adminAddr := waitForAdminAddr(t, out)
+	// The startup line is a diagnostic, so it belongs on stderr: stdout is
+	// reserved for audit records.
+	adminAddr := waitForAdminAddrIn(t, errOut)
 
 	resp, err := http.Get("http://" + adminAddr + "/healthz")
 	if err != nil {
@@ -274,8 +276,12 @@ func TestServeStartsProxiesAndShutsDownCleanly(t *testing.T) {
 		if r.code != 0 {
 			t.Errorf("exit = %d, want 0; stderr = %s", r.code, r.stderr)
 		}
-		if !strings.Contains(r.stdout, "chain head") && !strings.Contains(r.stderr, "chain head") {
-			t.Errorf("shutdown did not report the audit chain head:\nstdout: %s\nstderr: %s", r.stdout, r.stderr)
+		if !strings.Contains(r.stderr, "chain head") {
+			t.Errorf("shutdown did not report the audit chain head on stderr:\n%s", r.stderr)
+		}
+		if strings.TrimSpace(r.stdout) != "" {
+			t.Errorf("stdout carried diagnostics; it is the default audit sink and must carry "+
+				"audit records only:\n%s", r.stdout)
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("serve did not shut down")
@@ -427,26 +433,5 @@ func (s *syncBuffer) String() string {
 	return s.buf.String()
 }
 
-// waitForAdminAddr reads the admin address out of the startup line the server
-// prints. Binding to port 0 is only useful if the chosen port is announced,
-// so this parses real output rather than reaching into the server.
-func waitForAdminAddr(t *testing.T, out *syncBuffer) string {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		for _, line := range strings.Split(out.String(), "\n") {
-			if !strings.Contains(line, "admin=") {
-				continue
-			}
-			for _, field := range strings.Fields(line) {
-				if addr, ok := strings.CutPrefix(field, "admin="); ok {
-					return addr
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("server never printed its admin address; output was:\n%s", out.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
+// The address helper lives in audit_stream_test.go, which reads either
+// stream so the tests do not themselves decide which one the banner is on.

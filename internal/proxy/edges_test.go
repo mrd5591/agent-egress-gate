@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,6 +185,7 @@ func (failingAuditor) Append(audit.Record) (audit.Record, error) {
 func TestEnforcementContinuesWhenAuditingFails(t *testing.T) {
 	var reached int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reached, 1)
 		io.WriteString(w, "ok")
 	}))
 	defer up.Close()
@@ -202,8 +204,8 @@ func TestEnforcementContinuesWhenAuditingFails(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403 even though auditing failed", resp.StatusCode)
 	}
-	if reached != 0 {
-		t.Error("upstream was contacted")
+	if n := atomic.LoadInt32(&reached); n != 0 {
+		t.Errorf("upstream was contacted %d times on a denied request", n)
 	}
 }
 

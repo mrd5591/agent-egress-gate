@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -88,7 +89,9 @@ func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 
 func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int {
 	fs := newFlagSet("serve", stderr)
-	policyPath := fs.String("policy", "", "path to the policy file (required)")
+	policyPath := fs.String("policy", "", "path to the policy file")
+	policyEnv := fs.String("policy-env", "",
+		"name of an environment variable holding the policy YAML, instead of --policy")
 	listenAddr := fs.String("listen", "127.0.0.1:8080", "data listener address for agent traffic")
 	adminAddr := fs.String("admin", "127.0.0.1:9090", "admin listener address; never expose this to agents")
 	auditPath := fs.String("audit", "", "path to append the audit log to; empty writes to stdout")
@@ -100,20 +103,60 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 	if err := fs.Parse(args); err != nil {
 		return exitUsage
 	}
-	if *policyPath == "" {
-		fmt.Fprintln(stderr, "egressgate: --policy is required")
+
+	switch {
+	case *policyPath == "" && *policyEnv == "":
+		fmt.Fprintln(stderr, "egressgate: one of --policy or --policy-env is required")
 		fs.Usage()
+		return exitUsage
+	case *policyPath != "" && *policyEnv != "":
+		fmt.Fprintln(stderr, "egressgate: --policy and --policy-env are mutually exclusive")
 		return exitUsage
 	}
 
-	store, err := policy.LoadStore(*policyPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "egressgate: %v\n", err)
-		return exitFail
+	// Reading the policy from the environment is what lets a container run the
+	// binary directly, with no shell to materialise a file and no writable
+	// root filesystem. A policy loaded this way has no source path, so
+	// POST /reload correctly reports that there is nothing to reload from.
+	var store *policy.Store
+	var policySource string
+	if *policyEnv != "" {
+		raw, ok := os.LookupEnv(*policyEnv)
+		if !ok || raw == "" {
+			fmt.Fprintf(stderr, "egressgate: environment variable %s is unset or empty\n", *policyEnv)
+			return exitFail
+		}
+		p, err := policy.Parse([]byte(raw))
+		if err != nil {
+			fmt.Fprintf(stderr, "egressgate: %v\n", err)
+			return exitFail
+		}
+		store = policy.NewStore(p)
+		policySource = "$" + *policyEnv
+	} else {
+		s, err := policy.LoadStore(*policyPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "egressgate: %v\n", err)
+			return exitFail
+		}
+		store = s
+		policySource = *policyPath
 	}
 
+	// The audit sink defaults to stdout, so stdout must carry audit records
+	// and nothing else. Every diagnostic below goes to stderr, or the verifier
+	// this project exists to provide cannot read its own output.
 	auditWriter := io.Writer(stdout)
+	resumeHead, resumeSeq := audit.GenesisHash, uint64(0)
+
 	if *auditPath != "" {
+		head, seq, err := existingChainHead(*auditPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "egressgate: %v\n", err)
+			return exitFail
+		}
+		resumeHead, resumeSeq = head, seq
+
 		// #nosec G304 -- the audit path is an operator-supplied flag, not
 		// anything a proxied request can influence.
 		f, err := os.OpenFile(*auditPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -130,7 +173,10 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 		}()
 		auditWriter = f
 	}
-	auditLog := audit.New(auditWriter)
+
+	// Resume rather than New, so a restart continues the existing chain. A new
+	// chain in the same file would make every deploy look like tampering.
+	auditLog := audit.Resume(auditWriter, resumeHead, resumeSeq)
 
 	reg := prometheus.NewRegistry()
 	m := metrics.New(reg)
@@ -143,8 +189,10 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 		MaxTunnelBytes:        *maxTunnelBytes,
 	}, logger)
 
-	var serving bool
-	admin := adminsrv.Handler(reg, m, store, func() bool { return serving })
+	// Atomic because the admin server's goroutines read it while this one
+	// writes it around startup and shutdown.
+	var serving atomic.Bool
+	admin := adminsrv.Handler(reg, m, store, serving.Load)
 
 	// Listeners are opened before either server starts so that a port
 	// conflict is reported as a startup failure, and so that binding to port
@@ -174,9 +222,12 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 	go func() { errCh <- dataSrv.Serve(dataLn) }()
 	go func() { errCh <- adminSrv.Serve(adminLn) }()
 
-	serving = true
-	fmt.Fprintf(stdout, "listening: proxy=%s admin=%s policy=%s\n",
-		dataLn.Addr(), adminLn.Addr(), *policyPath)
+	serving.Store(true)
+	fmt.Fprintf(stderr, "listening: proxy=%s admin=%s policy=%s\n",
+		dataLn.Addr(), adminLn.Addr(), policySource)
+
+	stopCh, stopCancel := waitForStop(stop)
+	defer stopCancel()
 
 	select {
 	case err := <-errCh:
@@ -185,30 +236,58 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 			shutdown(dataSrv, adminSrv)
 			return exitFail
 		}
-	case <-waitForStop(stop):
+	case <-stopCh:
 	}
 
-	serving = false
+	serving.Store(false)
 	shutdown(dataSrv, adminSrv)
 
 	head, seq := auditLog.Head()
-	fmt.Fprintf(stdout, "audit chain head: %s after %d records\n", head, seq)
-	fmt.Fprintln(stdout, "record that hash somewhere the gate cannot write, or truncation of the log is undetectable")
+	fmt.Fprintf(stderr, "audit chain head: %s after %d records\n", head, seq)
+	fmt.Fprintln(stderr, "record that hash somewhere the gate cannot write, or truncation of the log is undetectable")
 	return exitOK
 }
 
-// waitForStop returns a channel that closes on the injected stop signal, or
-// on SIGINT/SIGTERM when none was injected.
-func waitForStop(stop <-chan struct{}) <-chan struct{} {
+// existingChainHead returns the head hash and last sequence number of an audit
+// log that is already on disk, so a restart can continue its chain.
+//
+// It refuses to continue a chain that does not verify. Appending to a broken
+// log would produce a file that can never verify again, and silently doing so
+// is how a tamper-evident log becomes decoration.
+func existingChainHead(path string) (string, uint64, error) {
+	// #nosec G304 -- operator-supplied flag.
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return audit.GenesisHash, 0, nil
+	}
+	if err != nil {
+		return "", 0, fmt.Errorf("reading existing audit log: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	res, err := audit.Verify(f)
+	if err != nil {
+		return "", 0, fmt.Errorf("reading existing audit log: %w", err)
+	}
+	if !res.OK {
+		return "", 0, fmt.Errorf(
+			"refusing to append to %s: its chain is already broken at record %d (%s)",
+			path, res.BreakAt, res.Problem)
+	}
+	return res.Head, res.LastSeq, nil
+}
+
+// waitForStop returns a channel that closes on the injected stop signal, or on
+// SIGINT/SIGTERM when none was injected, plus a cancel the caller must run.
+//
+// The cancel matters on the error path: if a server fails first, nothing else
+// would ever unregister the signal handler or release its goroutine.
+func waitForStop(stop <-chan struct{}) (<-chan struct{}, func()) {
 	if stop != nil {
-		return stop
+		return stop, func() {}
 	}
 	ctx, cancel := signalContext()
-	go func() {
-		<-ctx.Done()
-		cancel()
-	}()
-	return ctx.Done()
+	return ctx.Done(), cancel
 }
 
 func shutdown(servers ...*http.Server) {

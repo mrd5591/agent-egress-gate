@@ -14,8 +14,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"path"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mrd5591/agent-egress-gate/internal/audit"
@@ -179,6 +182,23 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	rec.Port = port
 	rec.Path = r.URL.Path
 
+	// A path prefix rule is only an enforcement if the path it matches is the
+	// path the upstream will route on. "/allowed/../secret" matches the prefix
+	// "/allowed/" and reaches "/secret" on any origin server that normalises,
+	// and "%2e%2e" hides the same trick from a naive comparison. Rather than
+	// rewrite what the client asked for, the gate refuses a request whose
+	// normalised path differs from the one it would forward.
+	if norm, ok := normalisedPath(r.URL); !ok {
+		rec.Decision = string(policy.Deny)
+		rec.Reason = fmt.Sprintf(
+			"path %q contains dot-segments or encoded separators; it normalises to %q, "+
+				"so a path rule could not be enforced on what the upstream would route",
+			r.URL.Path, norm)
+		h.finish(&rec, start, http.StatusBadRequest)
+		http.Error(w, "egressgate: "+rec.Reason, http.StatusBadRequest)
+		return
+	}
+
 	decision := h.eval.Evaluate(policy.Request{
 		Kind:   policy.KindHTTP,
 		Host:   host,
@@ -210,7 +230,7 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// redirects. Following one would reach a host the policy never saw.
 	resp, err := h.transport.RoundTrip(outReq)
 	if err != nil {
-		rec.BytesUp = counted.n
+		rec.BytesUp = counted.count()
 		h.finish(&rec, start, http.StatusBadGateway)
 		h.log.Warn("upstream request failed", "host", host, "port", port, "error", err)
 		http.Error(w, "egressgate: upstream request failed", http.StatusBadGateway)
@@ -231,7 +251,7 @@ func (h *Handler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn("copying response body failed", "host", host, "error", copyErr)
 	}
 
-	rec.BytesUp = counted.n
+	rec.BytesUp = counted.count()
 	rec.BytesDown = down
 	h.finish(&rec, start, resp.StatusCode)
 }
@@ -258,6 +278,30 @@ func (h *Handler) finish(rec *audit.Record, start time.Time, status int) {
 	}
 }
 
+// normalisedPath reports the cleaned form of a request path and whether it is
+// already normalised.
+//
+// Both the decoded path and the raw, still-encoded form are checked: an
+// encoded separator such as "%2f" survives path.Clean untouched but is decoded
+// by many origin servers, so a rule matching the encoded string would not
+// match what the upstream actually routes on.
+func normalisedPath(u *url.URL) (string, bool) {
+	raw := u.EscapedPath()
+	if strings.Contains(strings.ToLower(raw), "%2f") || strings.Contains(strings.ToLower(raw), "%5c") {
+		return raw, false
+	}
+
+	p := u.Path
+	if p == "" {
+		p = "/"
+	}
+	cleaned := path.Clean(p)
+	if cleaned != "/" && strings.HasSuffix(p, "/") {
+		cleaned += "/"
+	}
+	return cleaned, cleaned == p
+}
+
 func defaultPortFor(scheme string) int {
 	if scheme == "https" {
 		return 443
@@ -275,9 +319,15 @@ func clientIP(r *http.Request) string {
 
 // countingReader counts bytes read from a request body so the audit record
 // can report how much left the network.
+//
+// The count is atomic because the transport reads the body on its own write
+// goroutine, and RoundTrip returns as soon as response headers arrive. Any
+// upstream that answers before consuming the body, which is every 401, 413 or
+// 429, has the handler reading this counter while the transport is still
+// writing it.
 type countingReader struct {
 	r io.ReadCloser
-	n int64
+	n atomic.Int64
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
@@ -285,9 +335,11 @@ func (c *countingReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	n, err := c.r.Read(p)
-	c.n += int64(n)
+	c.n.Add(int64(n))
 	return n, err
 }
+
+func (c *countingReader) count() int64 { return c.n.Load() }
 
 func (c *countingReader) Close() error {
 	if c.r == nil {

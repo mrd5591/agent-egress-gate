@@ -90,7 +90,10 @@ func (l *Log) Append(r Record) (Record, error) {
 
 	r.Seq = l.seq + 1
 	if r.TS == "" {
-		r.TS = l.now().UTC().Format(time.RFC3339)
+		// Nanosecond resolution, because two decisions in the same second are
+		// otherwise indistinguishable by timestamp, which matters when the log
+		// is the evidence.
+		r.TS = l.now().UTC().Format(time.RFC3339Nano)
 	}
 	r.Prev = l.prev
 	r.Hash = ""
@@ -157,6 +160,10 @@ func chainHash(prev string, r Record) (string, error) {
 // where it stops holding.
 type VerifyResult struct {
 	Records int
+	// LastSeq is the sequence number of the final verified record. It is
+	// stated rather than inferred from Records, because equating the two
+	// assumes the chain starts at one, which a resumed log need not.
+	LastSeq uint64
 	Head    string
 	OK      bool
 	BreakAt uint64
@@ -181,8 +188,14 @@ func Verify(r io.Reader) (VerifyResult, error) {
 			continue
 		}
 
+		// DisallowUnknownFields because the chain covers the record's fields,
+		// not the bytes of the line. Without it, arbitrary keys can be spliced
+		// into an audited line and the chain still verifies, which would make
+		// the log's own format a place to hide things.
 		var rec Record
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&rec); err != nil {
 			res.OK = false
 			res.BreakAt = lastSeq + 1
 			res.Problem = fmt.Sprintf("could not decode record: %v", err)
@@ -218,6 +231,7 @@ func Verify(r io.Reader) (VerifyResult, error) {
 		lastSeq = rec.Seq
 		res.Records++
 		res.Head = rec.Hash
+		res.LastSeq = rec.Seq
 	}
 
 	if err := sc.Err(); err != nil {

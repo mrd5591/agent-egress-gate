@@ -129,17 +129,25 @@ func (h *Handler) pump(clientConn net.Conn, buffered io.Reader, upstream net.Con
 	var upBytes, downBytes int64
 	var cappedFlag atomic.Bool
 
+	// One shared activity clock for both directions. Giving each direction its
+	// own deadline would kill the tunnel whenever one side went quiet, which
+	// is exactly what a large download looks like: the client says nothing for
+	// minutes while megabytes arrive. The tunnel is idle only when neither
+	// direction has moved.
+	activity := newIdleClock(h.cfg.IdleTimeout)
+
 	// The client's read side is the buffered reader, so bytes that arrived
 	// with the CONNECT request are not lost. Deadlines are still set on the
 	// underlying connection, which is what the reader ultimately draws from.
-	clientSrc := &idleReader{r: buffered, conn: clientConn, idle: h.cfg.IdleTimeout}
-	upstreamSrc := &idleReader{r: upstream, conn: upstream, idle: h.cfg.IdleTimeout}
+	clientSrc := &idleReader{r: buffered, conn: clientConn, clock: activity}
+	upstreamSrc := &idleReader{r: upstream, conn: upstream, clock: activity}
 
-	var limitUp, limitDown io.Reader = clientSrc, upstreamSrc
-	if h.cfg.MaxTunnelBytes > 0 {
-		limitUp = io.LimitReader(clientSrc, h.cfg.MaxTunnelBytes)
-		limitDown = io.LimitReader(upstreamSrc, h.cfg.MaxTunnelBytes)
-	}
+	// The cap is applied on the write side, not the read side. A LimitReader
+	// would forward the cap and then report EOF, which is indistinguishable
+	// from a stream that simply ended on the boundary; capping the writer
+	// forwards exactly the cap and knows whether more was on its way.
+	upWriter := newCappedWriter(upstream, h.cfg.MaxTunnelBytes)
+	downWriter := newCappedWriter(clientConn, h.cfg.MaxTunnelBytes)
 
 	done := make(chan struct{}, 2)
 	var once sync.Once
@@ -151,18 +159,18 @@ func (h *Handler) pump(clientConn net.Conn, buffered io.Reader, upstream net.Con
 	}
 
 	go func() {
-		n, _ := io.Copy(upstream, limitUp)
+		n, _ := io.Copy(upWriter, clientSrc)
 		atomic.StoreInt64(&upBytes, n)
-		if h.cfg.MaxTunnelBytes > 0 && n >= h.cfg.MaxTunnelBytes {
+		if upWriter.exceeded() {
 			cappedFlag.Store(true)
 		}
 		done <- struct{}{}
 	}()
 
 	go func() {
-		n, _ := io.Copy(clientConn, limitDown)
+		n, _ := io.Copy(downWriter, upstreamSrc)
 		atomic.StoreInt64(&downBytes, n)
-		if h.cfg.MaxTunnelBytes > 0 && n >= h.cfg.MaxTunnelBytes {
+		if downWriter.exceeded() {
 			cappedFlag.Store(true)
 		}
 		done <- struct{}{}
@@ -201,23 +209,120 @@ func splitAuthority(authority string) (host string, port int, err error) {
 	if convErr != nil || n < 1 || n > 65535 {
 		return "", 0, fmt.Errorf("malformed port in CONNECT authority %q", authority)
 	}
+	// An empty host would rejoin as ":443", which under a default-allow policy
+	// dials the gate itself.
+	if h == "" {
+		return "", 0, fmt.Errorf("CONNECT authority %q has no host", authority)
+	}
 	return h, n, nil
 }
 
-// idleReader resets the connection's read deadline before every read, giving
-// a true idle timeout. An absolute deadline would kill a long but healthy
-// transfer; this only kills a silent one.
-type idleReader struct {
-	r    io.Reader
-	conn net.Conn
+// errTunnelCapExceeded stops a copy once the configured cap is reached.
+var errTunnelCapExceeded = errors.New("tunnel byte cap reached")
+
+// cappedWriter forwards at most limit bytes and records whether more was
+// offered. A limit of zero means no cap.
+type cappedWriter struct {
+	w         io.Writer
+	remaining int64
+	capped    bool
+	unlimited bool
+}
+
+func newCappedWriter(w io.Writer, limit int64) *cappedWriter {
+	return &cappedWriter{w: w, remaining: limit, unlimited: limit <= 0}
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	if c.unlimited {
+		return c.w.Write(p)
+	}
+	if c.remaining <= 0 {
+		c.capped = true
+		return 0, errTunnelCapExceeded
+	}
+
+	// A write larger than what remains is the moment the cap bites: forward
+	// the part that fits and stop. A write that exactly fills the remainder is
+	// not capped, because nothing was turned away.
+	over := int64(len(p)) > c.remaining
+	if over {
+		p = p[:c.remaining]
+	}
+
+	n, err := c.w.Write(p)
+	c.remaining -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	if over {
+		c.capped = true
+		return n, errTunnelCapExceeded
+	}
+	return n, nil
+}
+
+func (c *cappedWriter) exceeded() bool { return c.capped }
+
+// idleClock is the shared activity timestamp for one tunnel. Both directions
+// stamp it on every successful read, and both compute their deadline from it,
+// so the tunnel expires only when nothing has moved either way.
+type idleClock struct {
 	idle time.Duration
+	last atomic.Int64 // UnixNano of the last byte moved in either direction
+}
+
+func newIdleClock(idle time.Duration) *idleClock {
+	c := &idleClock{idle: idle}
+	c.last.Store(time.Now().UnixNano())
+	return c
+}
+
+func (c *idleClock) touch() { c.last.Store(time.Now().UnixNano()) }
+
+// deadline is when the tunnel should expire given the last activity on either
+// side. It is always at least a moment in the future, so a direction that
+// wakes just after the other one moved does not immediately time itself out.
+func (c *idleClock) deadline() time.Time {
+	return time.Unix(0, c.last.Load()).Add(c.idle)
+}
+
+// idleReader resets the connection's read deadline before every read, giving a
+// true idle timeout on the tunnel as a whole. An absolute deadline would kill
+// a long but healthy transfer, and a per-direction deadline would kill a
+// download whose client has nothing to say.
+type idleReader struct {
+	r     io.Reader
+	conn  net.Conn
+	clock *idleClock
 }
 
 func (i *idleReader) Read(p []byte) (int, error) {
-	if i.idle > 0 {
-		// A failure here means the connection is already gone, in which case
-		// the Read below reports the real error.
-		_ = i.conn.SetReadDeadline(time.Now().Add(i.idle))
+	for {
+		if i.clock.idle > 0 {
+			// A failure here means the connection is already gone, in which
+			// case the Read below reports the real error.
+			_ = i.conn.SetReadDeadline(i.clock.deadline())
+		}
+
+		n, err := i.r.Read(p)
+		if n > 0 {
+			i.clock.touch()
+		}
+
+		// A deadline set before a blocking read does not move when the other
+		// direction becomes active, so a quiet side will wake up spuriously
+		// during a busy transfer. If the shared clock has advanced past the
+		// deadline we were waiting on, the tunnel is not idle: extend and keep
+		// waiting rather than tearing it down.
+		if n == 0 && i.clock.idle > 0 && isTimeout(err) && time.Now().Before(i.clock.deadline()) {
+			continue
+		}
+		return n, err
 	}
-	return i.r.Read(p)
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
