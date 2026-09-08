@@ -14,8 +14,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # One Go version, two operating systems. The floor is 1.25 because a
+        # dependency requires it, and the axis that actually finds bugs in a
+        # proxy is the platform, not the compiler patch level: socket close
+        # semantics and deadline behaviour differ between Windows and Linux.
         os: [ubuntu-latest, windows-latest]
-        go: ["1.24", "1.25"]
+        go: ["1.25"]
 
     steps:
       - uses: actions/checkout@v4
@@ -24,6 +28,11 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
+
+      # A drifted go.sum fails the build on a clean runner but not locally,
+      # where the module cache papers over it.
+      - name: Verify go.mod and go.sum are tidy
+        run: go mod tidy -diff
 
       - name: Verify formatting
         shell: bash
