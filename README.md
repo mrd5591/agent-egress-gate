@@ -161,6 +161,12 @@ can reload the policy can replace the policy that constrains it.
   --max-tunnel-bytes 0        # 0 means no cap; set it to bound one tunnel
 ```
 
+`--max-tunnel-bytes` is a resource guard, not an exfiltration control. It caps
+each direction of a CONNECT tunnel, and nothing else: the plain-HTTP path has
+no cap, so an agent allowed a host over HTTP can still POST without bound. Read
+it as "one tunnel cannot consume the gate", and rely on the host allowlist for
+the rest.
+
 Point the agent at it:
 
 ```bash

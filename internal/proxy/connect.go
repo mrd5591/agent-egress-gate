@@ -125,6 +125,14 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 // pump copies bytes in both directions until either side finishes, then
 // closes both so the other copy cannot block forever. It returns the bytes
 // moved each way and whether a byte cap ended the tunnel.
+//
+// One consequence is worth stating rather than leaving implicit: a client that
+// half-closes, sending CloseWrite and then waiting for a reply, ends the
+// client-to-upstream copy and therefore the whole tunnel, so a late upstream
+// response is lost. Squid and httputil's proxy behave the same way and TLS
+// rarely half-closes, so this is a deliberate simplification. A protocol that
+// genuinely needed half-close through the tunnel would require this to
+// distinguish "one direction finished" from "the tunnel is over".
 func (h *Handler) pump(clientConn net.Conn, buffered io.Reader, upstream net.Conn) (up, down int64, capped bool) {
 	var upBytes, downBytes int64
 	var cappedFlag atomic.Bool
