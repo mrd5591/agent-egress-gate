@@ -14,4 +14,5 @@
 # Lock files belong to root modules. A reusable module should not ship one.
 terraform/modules/*/.terraform.lock.hcl
 
-audit.log
+*audit.log
+*audit-*.log
