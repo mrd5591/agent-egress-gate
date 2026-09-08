@@ -16,3 +16,6 @@ terraform/modules/*/.terraform.lock.hcl
 
 *audit.log
 *audit-*.log
+
+# Claude Code worktrees live here; they are workspaces, not repository content.
+.claude/worktrees/
