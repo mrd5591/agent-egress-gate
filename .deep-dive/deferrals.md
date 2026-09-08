@@ -71,14 +71,6 @@ Zero means unlimited for these (unlike `http.DefaultTransport`), so a
 long-running gate holds an idle socket for every upstream it has ever contacted.
 **Next action:** set the four fields, mirroring `DefaultTransport`'s values.
 
-### `hours` · small · run 1 — Base images float while every tool is pinned
-`Dockerfile` uses `golang:1.25-alpine` and `alpine:3.20` by tag. Every other
-tool in the build — terraform, tflint, golangci-lint, govulncheck — is pinned to
-an exact version on the stated principle that an unpinned tool works today and
-fails later for reasons nobody wrote down. The two inputs that actually ship
-are the unpinned ones.
-**Next action:** pin both by digest and note the refresh procedure.
-
 ### `hours` · own-pr · run 1 — A rotated log segment cannot be verified
 `Verify` always starts from `GenesisHash` and sequence 0, so a segment written
 by `Resume` into a fresh file always reports BROKEN — `sequence jumped from 0
