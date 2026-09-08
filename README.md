@@ -131,6 +131,14 @@ Three honest limits:
 - A tunnel's record is written when the tunnel **closes**, because the byte
   counts are not known before then. While a long tunnel is open it is absent
   from the log. Watch `egressgate_active_tunnels` for that window.
+- A restart continues the existing chain rather than starting a new one, so a
+  deploy does not look like tampering. If a previous run was killed mid-write,
+  the gate discards the partial final record, says so on stderr, and resumes
+  from the last complete one. That case is deliberately distinguished from a
+  real break: refusing to start on a torn write would turn one crash into a
+  crash loop whose only remedy is editing the audit log. A record that was
+  actually altered still stops the gate, and the error names a new file to
+  start a fresh chain in, so the log stays as evidence.
 - The hashed bytes are Go's `encoding/json` output, which escapes `<`, `>` and
   `&` as `\u003c`, `\u003e` and `\u0026`. Writer and verifier agree, so this is
   invisible in normal use, but a verifier reimplemented in another language
@@ -171,6 +179,12 @@ previous policy in force rather than briefly opening the gate:
 ```bash
 curl -X POST http://127.0.0.1:9090/reload
 ```
+
+Reload re-reads a policy **file**. The ECS task definition runs the gate with
+`--policy-env`, so the deployed configuration has no file behind its policy:
+`/reload` answers 400 there, and changing the SSM parameter means a new
+deployment. `--policy` with `POST /reload` is for the case where the policy is
+a file the gate can read again.
 
 ## Terraform
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -150,7 +151,7 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 	resumeHead, resumeSeq := audit.GenesisHash, uint64(0)
 
 	if *auditPath != "" {
-		head, seq, err := existingChainHead(*auditPath)
+		head, seq, err := existingChainHead(*auditPath, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr, "egressgate: %v\n", err)
 			return exitFail
@@ -254,7 +255,15 @@ func cmdServe(args []string, stdout, stderr io.Writer, stop <-chan struct{}) int
 // It refuses to continue a chain that does not verify. Appending to a broken
 // log would produce a file that can never verify again, and silently doing so
 // is how a tamper-evident log becomes decoration.
-func existingChainHead(path string) (string, uint64, error) {
+//
+// A torn final line is treated differently, and the difference matters. A
+// process killed mid-write leaves an incomplete record; that is an interrupted
+// write, not tampering. Refusing to start on it would turn one OOM kill into a
+// permanent crash loop whose only remedy is editing the audit log, which is
+// the very act the chain exists to make suspicious. So the gate resumes from
+// the last complete record, says loudly that it discarded a partial one, and
+// keeps running.
+func existingChainHead(path string, stderr io.Writer) (string, uint64, error) {
 	// #nosec G304 -- operator-supplied flag.
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -271,10 +280,74 @@ func existingChainHead(path string) (string, uint64, error) {
 	}
 	if !res.OK {
 		return "", 0, fmt.Errorf(
-			"refusing to append to %s: its chain is already broken at record %d (%s)",
+			"refusing to append to %s: its chain is already broken at record %d (%s).\n"+
+				"  This log cannot be made verifiable again by appending to it. Investigate the\n"+
+				"  break, then point --audit at a new file to start a fresh chain; keep this one\n"+
+				"  as the evidence it is",
 			path, res.BreakAt, res.Problem)
 	}
+	if res.TruncatedTail {
+		// The partial bytes must go before anything is appended, or the next
+		// record lands on the end of the torn line and the log can never
+		// verify again.
+		dropped, terr := truncatePartialLine(path)
+		if terr != nil {
+			return "", 0, fmt.Errorf("discarding the partial final record of %s: %w", path, terr)
+		}
+		fmt.Fprintf(stderr,
+			"egressgate: %s ended mid-record, so a previous run was killed while writing.\n"+
+				"  Discarded %d bytes of a partial record and resumed from record %d; "+
+				"the %d complete records verify.\n",
+			path, dropped, res.LastSeq, res.Records)
+	}
 	return res.Head, res.LastSeq, nil
+}
+
+// truncatePartialLine cuts a file back to the end of its last complete line
+// and reports how many bytes went. A file with no newline at all is emptied,
+// which is correct: it holds one partial record and nothing else.
+//
+// It searches backwards in chunks rather than reading the file, because an
+// audit log is append-only and can be large, and only its tail is in question.
+func truncatePartialLine(path string) (int64, error) {
+	// #nosec G304 -- operator-supplied flag, the same path already verified.
+	f, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, err
+	}
+
+	const chunk = 64 * 1024
+	buf := make([]byte, chunk)
+
+	for end := size; end > 0; {
+		start := end - chunk
+		if start < 0 {
+			start = 0
+		}
+		n := int(end - start)
+		if _, err := f.ReadAt(buf[:n], start); err != nil && err != io.EOF {
+			return 0, err
+		}
+		if i := bytes.LastIndexByte(buf[:n], '\n'); i >= 0 {
+			keep := start + int64(i) + 1
+			if err := f.Truncate(keep); err != nil {
+				return 0, err
+			}
+			return size - keep, nil
+		}
+		end = start
+	}
+
+	if err := f.Truncate(0); err != nil {
+		return 0, err
+	}
+	return size, nil
 }
 
 // waitForStop returns a channel that closes on the injected stop signal, or on
@@ -332,6 +405,14 @@ func cmdVerify(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "chain intact: %d records\n", res.Records)
 	fmt.Fprintf(stdout, "head: %s\n", res.Head)
+	if res.TruncatedTail {
+		// Worth saying even though the chain holds: the operator should know
+		// the log stops mid-record, and that the missing decision is missing
+		// because a process died, not because someone removed it.
+		fmt.Fprintln(stdout,
+			"note: the log ends mid-record, so the last write was interrupted. "+
+				"Every complete record verifies; the partial one is not counted.")
+	}
 	return exitOK
 }
 

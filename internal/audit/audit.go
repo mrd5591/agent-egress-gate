@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -23,10 +24,6 @@ import (
 
 // GenesisHash is the Prev value of the first record in a chain.
 const GenesisHash = "0000000000000000000000000000000000000000000000000000000000000000"
-
-// maxLineBytes bounds a single audit line. Reason strings are short, but a
-// pathological host header should not be able to stop verification.
-const maxLineBytes = 1 << 20
 
 // Record is one proxy decision.
 //
@@ -168,6 +165,16 @@ type VerifyResult struct {
 	OK      bool
 	BreakAt uint64
 	Problem string
+	// TruncatedTail reports that the log ended mid-record: its final line
+	// arrived without a terminating newline. That is an interrupted write, a
+	// process killed or a disk filled, not evidence of tampering. Every
+	// complete record before it still verifies and OK stays true.
+	//
+	// The distinction is operational, not pedantic. Treating a torn final
+	// write as a broken chain turns an OOM kill into a gate that refuses to
+	// start, whose only remedy would be editing the audit log, which is
+	// precisely the act the chain exists to make suspicious.
+	TruncatedTail bool
 }
 
 // Verify walks a log and recomputes the chain. It returns an error only if
@@ -176,16 +183,35 @@ type VerifyResult struct {
 func Verify(r io.Reader) (VerifyResult, error) {
 	res := VerifyResult{OK: true, Head: GenesisHash}
 
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64*1024), maxLineBytes)
+	// A bufio.Reader rather than a Scanner, because whether the final line
+	// carried its newline is the difference between a torn write and a
+	// tampered record, and a Scanner does not report it.
+	br := bufio.NewReaderSize(r, 64*1024)
 
 	var prev = GenesisHash
 	var lastSeq uint64
 
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
+	for {
+		raw, err := br.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return res, fmt.Errorf("audit: read log: %w", err)
+		}
+
+		terminated := strings.HasSuffix(raw, "\n")
+		line := strings.TrimSpace(raw)
+
 		if line == "" {
+			if errors.Is(err, io.EOF) {
+				break
+			}
 			continue
+		}
+
+		// An unterminated final line is an interrupted write. Stop here and
+		// report the truncation; the records before it stand.
+		if !terminated && errors.Is(err, io.EOF) {
+			res.TruncatedTail = true
+			break
 		}
 
 		// DisallowUnknownFields because the chain covers the record's fields,
@@ -232,10 +258,11 @@ func Verify(r io.Reader) (VerifyResult, error) {
 		res.Records++
 		res.Head = rec.Hash
 		res.LastSeq = rec.Seq
+
+		if errors.Is(err, io.EOF) {
+			break
+		}
 	}
 
-	if err := sc.Err(); err != nil {
-		return res, fmt.Errorf("audit: read log: %w", err)
-	}
 	return res, nil
 }
