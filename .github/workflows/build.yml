@@ -235,10 +235,38 @@ jobs:
       # rate limit with every other runner on its host. Not hypothetical: this
       # step failed with "403 API rate limit exceeded" on a documentation-only
       # commit. An authenticated request gets its own, far higher limit.
+
+      # The plugin is cached so the common path makes no network call at all.
+      # Authenticating fixed the rate-limit cause of a red run, but not the
+      # class: a later run went red on a 500 from checksums.txt.sig and passed
+      # on a plain re-run. Neither failure had anything to do with the code
+      # being linted. The key covers the tflint config and the version pinned
+      # above, so changing either fetches afresh.
+      - name: Cache tflint plugins
+        uses: actions/cache@v4
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-v0.53.0-${{ runner.os }}-${{ hashFiles('.tflint.hcl') }}
+
       - name: tflint
         env:
           TFLINT_CONFIG_FILE: ${{ github.workspace }}/.tflint.hcl
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tflint --init
+          # And a bounded retry for the cache-miss path, because the remaining
+          # failure mode is a transient GitHub-side error on a fetch this job
+          # only needs in order to lint unchanged HCL. Three attempts with a
+          # widening pause; a genuinely broken config still fails, just after
+          # ~30 seconds rather than immediately.
+          for attempt in 1 2 3; do
+            if tflint --init; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::tflint --init failed three times; treating it as a real failure"
+              exit 1
+            fi
+            echo "tflint --init failed (attempt $attempt/3); retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
           tflint --recursive --minimum-failure-severity=error

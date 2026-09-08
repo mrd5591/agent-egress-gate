@@ -11,89 +11,19 @@ Ceiling on `## Open`: 20. Rulings cap: 5.
 
 ## Open
 
-### `money` · own-pr · run 1 — A tunnel open at shutdown leaves no audit record
-A CONNECT record is written when the tunnel closes, and nothing drains or
-audits an in-flight tunnel at SIGTERM. `http.Server.Shutdown` does not wait on
-hijacked connections, and there is no `WaitGroup`/`ConnState`/
-`RegisterOnShutdown` anywhere. A tunnel open when the task stops — the normal
-case at the end of a CI job — is simply absent from the evidence, and it can
-also race the chain-head print.
-**Next action:** track hijacked connections and, at shutdown, close them and
-write their records before printing the head.
+_(none — the 2026-09-08 debt pass drained the ledger. See `resolved.md`.)_
 
-### `money` · small · run 1 — `verify` exits 0 on an empty log
-An empty or whitespace-only file is reported as `chain intact: 0 records`,
-exit 0, so a consumer wired to the exit status cannot tell "nothing was
-recorded" from "everything verified". The `container` CI job's vacuity was
-closed this pass with a record-count assertion, but the tool still has the gap
-and every other caller inherits it.
-**Design gate.** Default if nobody rules by run 3: add `--min-records N`
-(default 0, so today's behaviour is unchanged) and use it wherever a caller
-knows traffic should have occurred.
+The one thing that pass could not do locally, and which is worth knowing before
+the next one: `go test -race` still cannot run on this machine (no C compiler,
+so cgo is unavailable and `-race` requires it — re-verified, not inherited from
+the prior note). Every concurrency claim about the new tunnel-shutdown code is
+therefore source-reading plus non-race test execution. CI runs the race
+detector, and it is the gate that matters for that code.
 
-### `money` · small · run 1 — Audit log group can be destroyed silently
-`aws_cloudwatch_log_group.gate` has no `prevent_destroy`, and its name derives
-from `var.name`, so renaming the module instance deletes the evidence artefact
-the product is built around.
-**Next action:** add a `lifecycle { prevent_destroy = true }`, or a variable
-that governs it, and say why in the module docs.
-
-### `step` · small · run 1 — `check` and `serve` disagree on dot-segment paths
-`egressgate check GET http://example.com/allowed/../secret` reports **allow**,
-while the running proxy 400s that request in `normalisedPath` before policy is
-consulted. This contradicts the README and `run.go`'s own comment that `check`
-"never promises an allow the gate would refuse". The direction is fail-safe
-(the gate is stricter than the advice), but the tool's whole purpose is to model
-the gate exactly.
-**Next action:** share one normalisation path between `check` and the proxy;
-today `normalisedPath` is unexported in `internal/proxy`, so this needs a small
-move rather than a copy.
-
-### `step` · small · run 1 — ECS service races its execution-role policy
-`aws_ecs_service.gate` depends on `aws_iam_role.execution` but not on
-`aws_iam_role_policy.execution`, so tasks can launch before the inline policy
-exists, fail the image pull or `GetParameters`, and trip the deployment
-circuit breaker on a correct configuration.
-**Next action:** add the policy to `depends_on`.
-
-### `step` · small · run 1 — Gate egress is hardcoded to 80/443
-A policy rule may name arbitrary `ports`, and the gate's security group only
-allows 80 and 443 outbound. A rule the gate accepts, evaluates as allow, and
-audits as allow becomes an unexplained upstream timeout, with no variable to
-widen the group.
-**Next action:** either derive the egress ports from a variable, or reject a
-policy naming a port the deployment cannot reach — and say which in the README.
-
-### `hours` · small · run 1 — Transport has no idle or handshake bounds
-`internal/proxy/proxy.go` builds an `http.Transport` without
-`IdleConnTimeout`, `MaxIdleConns`, `MaxConnsPerHost` or `TLSHandshakeTimeout`.
-Zero means unlimited for these (unlike `http.DefaultTransport`), so a
-long-running gate holds an idle socket for every upstream it has ever contacted.
-**Next action:** set the four fields, mirroring `DefaultTransport`'s values.
-
-### `hours` · own-pr · run 1 — A rotated log segment cannot be verified
-`Verify` always starts from `GenesisHash` and sequence 0, so a segment written
-by `Resume` into a fresh file always reports BROKEN — `sequence jumped from 0
-to 4`. `VerifyResult.LastSeq`'s own comment acknowledges a resumed log need not
-start at one, but there is no `VerifyFrom(head, seq)` entry point.
-**Next action:** add one, and let `verify` take the expected head and sequence.
-
-### `hours` · small · run 1 — Audit timestamps are not sortable
-Records use `time.RFC3339Nano`, which strips trailing zeros, so precision
-varies per record and the timestamps do not sort lexicographically. Harmless to
-the chain (the string is hashed as written) but wrong for an evidence log that
-people will sort and diff.
-**Next action:** fixed-width nanoseconds.
-
-### `hours` · small · run 1 — `tflint --init` has no retry and fails on a live GitHub API blip
-The plugin install fetches the AWS ruleset from the GitHub releases API on every
-run, with no retry, so a transient API failure reds the whole `terraform` job on
-a commit that touches no HCL. Seen twice now for different reasons: a `403 API
-rate limit exceeded` (fixed by authenticating with `GITHUB_TOKEN`, commit
-1d4c731) and a `500` on `checksums.txt.sig` during this pass, which passed on a
-plain re-run. Authenticating fixed the rate-limit cause but not the class.
-**Next action:** cache the plugin directory across runs, or wrap `tflint --init`
-in a bounded retry, so a GitHub-side blip does not read as a code failure.
+Terraform, by contrast, **was** executed this pass: `fmt -check`, `init
+-backend=false` and `validate` all ran locally against both the module and the
+example, closing a coverage gap that had been carried since the first pass.
+`tflint` and `govulncheck` remain CI-only.
 
 ## Accepted / won't-action
 
@@ -110,3 +40,9 @@ in a bounded retry, so a GitHub-side blip does not read as a code failure.
 - **The gate task is the trust boundary**, and the admin plane is separated by
   network placement rather than authentication. Both are stated in the threat
   model.
+- **The policy's ports and the security group's ports are not cross-checked.**
+  Raised and closed as far as it can be: `upstream_ports` now exists so the
+  deployment *can* be widened, and the README states the obligation. Terraform
+  cannot verify the pair, because the policy lives in an SSM parameter the
+  module never reads — by design. Do not re-file this as an open gap; it is a
+  documented operator obligation.

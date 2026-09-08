@@ -204,3 +204,34 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+variable "upstream_ports" {
+  description = <<-EOT
+    TCP ports the gate may reach on the internet. These must be a superset of
+    every port named by a rule in the policy: the gate can only forward what
+    its security group lets out, and a policy rule naming a port that is not
+    here evaluates as allow, is audited as allow, and then times out with
+    nothing recording why.
+
+    Terraform cannot verify this for you. The policy lives in an SSM parameter
+    this module deliberately never reads, so keeping the two in step is an
+    operator obligation. Widen a policy's ports, widen this.
+  EOT
+  type        = list(number)
+  default     = [80, 443]
+
+  validation {
+    condition     = length(var.upstream_ports) > 0
+    error_message = "The upstream_ports must name at least one port; a gate that can reach nothing is not a gate."
+  }
+
+  validation {
+    condition     = alltrue([for p in var.upstream_ports : p >= 1 && p <= 65535])
+    error_message = "Every entry in upstream_ports must be a TCP port between 1 and 65535."
+  }
+
+  validation {
+    condition     = length(distinct(var.upstream_ports)) == length(var.upstream_ports)
+    error_message = "The upstream_ports must not repeat a port; duplicates collide as security group rules."
+  }
+}

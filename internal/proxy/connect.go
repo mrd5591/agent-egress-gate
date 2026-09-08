@@ -33,6 +33,11 @@ import (
 // tunnel is therefore absent from the log while it is running. The
 // egressgate_active_tunnels gauge is what covers that window; anyone watching
 // for live activity should watch the gauge, not tail the log.
+//
+// A tunnel still open when the gate stops is not left unrecorded, though.
+// Handler.Shutdown closes both ends and waits for this function to write the
+// record, so the end of a CI job — where every tunnel is open at SIGTERM —
+// produces evidence rather than silence.
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	rec := audit.Record{
@@ -74,6 +79,18 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Refuse before dialling, not after. A gate that is shutting down must not
+	// open a new upstream connection it has no intention of auditing properly,
+	// and refusing here is also the only point at which a real HTTP response
+	// is still possible: past the hijack below, the client has already been
+	// told the tunnel is established.
+	if h.isClosing() {
+		rec.Reason = "the gate was shutting down; the tunnel was refused rather than opened unaudited"
+		h.finish(&rec, start, http.StatusServiceUnavailable)
+		http.Error(w, "egressgate: "+rec.Reason, http.StatusServiceUnavailable)
+		return
+	}
+
 	upstream, err := h.dialer.DialContext(r.Context(), "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		h.finish(&rec, start, http.StatusBadGateway)
@@ -108,6 +125,24 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		h.finish(&rec, start, http.StatusBadGateway)
 		return
 	}
+
+	// Registration must happen before the first byte moves, so that a shutdown
+	// racing this tunnel either waits for its record or refuses it outright.
+	// The deferred unregister runs after the function body, and therefore
+	// after finish has written the record — which is what makes Shutdown's
+	// wait mean "every tunnel is audited" rather than "every tunnel is closed".
+	// Shutdown can still have begun between the check above and here. There is
+	// no HTTP response left to send — the 200 has gone — so the tunnel is
+	// simply not started and the attempt is recorded. The record is the point:
+	// the failure this whole mechanism exists to prevent is a tunnel that
+	// leaves no trace, and that includes one refused in this window.
+	unregister, started := h.registerTunnel(clientConn, upstream)
+	if !started {
+		rec.Reason = "the gate began shutting down as the tunnel opened; it was closed before carrying traffic"
+		h.finish(&rec, start, http.StatusServiceUnavailable)
+		return
+	}
+	defer unregister()
 
 	h.metrics.Tunnels.Inc()
 	defer h.metrics.Tunnels.Dec()
