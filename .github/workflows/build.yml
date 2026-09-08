@@ -120,7 +120,14 @@ jobs:
         with:
           tflint_version: v0.53.0
 
+      # TFLINT_CONFIG_FILE must be absolute. With --recursive, tflint changes
+      # into each module directory and looks for .tflint.hcl there, so without
+      # this the AWS ruleset never loads and the step passes unconditionally.
+      # Verified by planting a resource with an invalid instance type: the run
+      # was silent without this variable and failed with it.
       - name: tflint
+        env:
+          TFLINT_CONFIG_FILE: ${{ github.workspace }}/.tflint.hcl
         run: |
           tflint --init
           tflint --recursive --minimum-failure-severity=error
