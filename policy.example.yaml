@@ -1,0 +1,37 @@
+# Starter policy for a coding agent in CI.
+#
+# Rules with methods or paths apply to plain HTTP only. A CONNECT tunnel,
+# which is every https:// request, can only be authorised by a host-only rule,
+# because method and path are not visible once TLS starts.
+
+version: 1
+default: deny
+
+rules:
+  # Package registries. Host-only, so HTTPS works.
+  - name: go-modules
+    hosts: ["proxy.golang.org", "sum.golang.org", "storage.googleapis.com"]
+
+  - name: python-packages
+    hosts: ["pypi.org", "*.pypi.org", "files.pythonhosted.org"]
+
+  - name: npm-packages
+    hosts: ["registry.npmjs.org"]
+
+  # Source and API access. Also host-only: a tunnel to github.com cannot be
+  # narrowed to specific repositories from outside the TLS session.
+  - name: github
+    hosts: ["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com"]
+
+  # A rule that constrains method and path, so it applies to plain HTTP only.
+  # Pointed at an https:// URL it refuses and the denial names this rule:
+  #
+  #   egressgate check --policy policy.example.yaml GET https://metadata.internal/v1/status
+  #
+  # Note there is no `ports` here, so it covers 80 and 443. Adding `ports: [80]`
+  # would make an HTTPS attempt fail earlier, on the port, and the denial would
+  # read "no rule matched" instead of explaining the tunnel restriction.
+  - name: internal-metadata-readonly
+    hosts: ["metadata.internal"]
+    methods: ["GET"]
+    paths: ["/v1/status"]

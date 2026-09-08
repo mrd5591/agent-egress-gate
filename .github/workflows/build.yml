@@ -1,0 +1,191 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A superseded push should not keep burning runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  go:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One Go version, two operating systems. The floor is 1.25 because a
+        # dependency requires it, and the axis that actually finds bugs in a
+        # proxy is the platform, not the compiler patch level: socket close
+        # semantics and deadline behaviour differ between Windows and Linux.
+        os: [ubuntu-latest, windows-latest]
+        go: ["1.25"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      # A drifted go.sum fails the build on a clean runner but not locally,
+      # where the module cache papers over it.
+      - name: Verify go.mod and go.sum are tidy
+        run: go mod tidy -diff
+
+      - name: Verify formatting
+        shell: bash
+        run: |
+          unformatted="$(gofmt -l . | grep -v '^$' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The race detector needs cgo. It is enabled explicitly because the
+      # Windows runner defaults CGO_ENABLED to 0 when no compiler is on PATH,
+      # which would silently skip race detection rather than fail.
+      - name: Test with race detector and coverage floor
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: ./scripts/coverage.sh
+
+      - name: Build
+        run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # Installed rather than taken from the marketplace action, so the version
+      # here is the same one the config was written against and verified with.
+      # The config is v2 format; a v1 binary would fail to parse it.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+
+      - name: Lint
+        run: golangci-lint run ./...
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      # Pinned, for the same reason the Terraform provider is pinned: an
+      # unpinned tool is one that works today and fails later for reasons
+      # nobody wrote down.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
+
+  # The container is the artefact the Terraform actually runs, and nothing was
+  # exercising it. That is how a task definition passing a shell invocation to
+  # an image with an ENTRYPOINT survived to code review: `terraform validate`
+  # cannot see inside container_definitions, and no job ever started the
+  # image. This job runs the container the way ECS does and drives traffic
+  # through it.
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Build the image
+        run: docker build -t egressgate:ci .
+
+      - name: Run it the way the task definition does
+        run: |
+          set -euo pipefail
+
+          docker run --rm -d --name egci --read-only \
+            -e EGRESSGATE_POLICY="$(cat policy.example.yaml)" \
+            -p 18080:8080 -p 19090:9090 \
+            egressgate:ci \
+            serve --policy-env EGRESSGATE_POLICY \
+                  --listen 0.0.0.0:8080 --admin 0.0.0.0:9090
+
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:19090/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:19090/healthz
+
+          # An allowed host tunnels, a denied host is refused.
+          allowed="$(curl -s -o /dev/null -w '%{http_code}' --proxy http://127.0.0.1:18080 https://pypi.org/simple/ || true)"
+          denied="$(curl -s -o /dev/null -w '%{http_code}' --proxy http://127.0.0.1:18080 http://example.com/ || true)"
+          echo "allowed=$allowed denied=$denied"
+          test "$allowed" = "200"
+          test "$denied" = "403"
+
+          # stdout must be audit records and nothing else, because that is what
+          # the awslogs driver collects and what `verify` has to read.
+          docker logs egci 2>/dev/null > container-audit.log
+          docker rm -f egci >/dev/null
+
+          go build -o egressgate ./cmd/egressgate
+          ./egressgate verify --audit container-audit.log
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.1"
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform fmt -check -recursive terraform/
+
+      # -backend=false because there is no state backend and none is needed:
+      # this job validates configuration, it does not plan or apply. See the
+      # README on why nothing here is applied.
+      - name: Validate module
+        working-directory: terraform/modules/egress-gate
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: Validate example
+        working-directory: terraform/example
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.0
+
+      # TFLINT_CONFIG_FILE must be absolute. With --recursive, tflint changes
+      # into each module directory and looks for .tflint.hcl there, so without
+      # this the AWS ruleset never loads and the step passes unconditionally.
+      # Verified by planting a resource with an invalid instance type: the run
+      # was silent without this variable and failed with it.
+      - name: tflint
+        env:
+          TFLINT_CONFIG_FILE: ${{ github.workspace }}/.tflint.hcl
+        run: |
+          tflint --init
+          tflint --recursive --minimum-failure-severity=error

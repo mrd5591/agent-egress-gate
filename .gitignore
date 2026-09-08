@@ -1,9 +1,18 @@
 /egressgate
 /egressgate.exe
 /dist/
-*.out
-coverage.*
+
+# Coverage artefacts. Anchored and extension-specific on purpose: a bare
+# "coverage.*" also swallows scripts/coverage.sh, which is the CI gate.
+/coverage.out
+/coverage.html
+
 .terraform/
 *.tfstate
 *.tfstate.*
-audit.log
+
+# Lock files belong to root modules. A reusable module should not ship one.
+terraform/modules/*/.terraform.lock.hcl
+
+*audit.log
+*audit-*.log

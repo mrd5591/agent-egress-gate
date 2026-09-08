@@ -1,0 +1,42 @@
+version: "2"
+
+# Linters chosen for what they catch in a network proxy specifically:
+# bodyclose finds a leaked upstream response body, gosec finds a missing
+# ReadHeaderTimeout and loose file permissions, errcheck finds the ignored
+# Close that quietly loses a write error, noctx finds a listener or request
+# built without a context and therefore without a deadline.
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - noctx
+    - revive
+
+  settings:
+    errcheck:
+      # Writing to the CLI's own stdout or stderr. There is no useful recovery
+      # from a failed write to stderr, and checking each call would bury the
+      # Close and Write errors that do matter under a hundred that do not.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+  exclusions:
+    rules:
+      # Test files legitimately ignore errors on teardown paths, build
+      # requests without a context, read bodies they do not close, and take
+      # handler parameters they do not use.
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - gosec
+          - noctx
+          - revive
