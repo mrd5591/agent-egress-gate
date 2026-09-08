@@ -196,11 +196,20 @@ starting point, not as something known to stand up on the first try.
 
 ```bash
 docker build -t egressgate .
+
+docker run --rm -p 8080:8080 -p 9090:9090 \
+  -v "$(pwd)/policy.example.yaml:/etc/egressgate/policy.yaml:ro" \
+  egressgate
 ```
 
-Static binary, non-root user, Alpine base. Alpine rather than distroless
-because the ECS task definition uses a shell to write the policy file and
-`wget` for its health check.
+Static binary, non-root user (uid 65532), Alpine base. Alpine rather than
+distroless because the ECS task definition uses a shell to write the policy
+file and `wget` for its health check.
+
+Unlike the Terraform, this path **has** been run: the image was built, started
+with the example policy mounted, and driven with real traffic. An allowed host
+returned 200 through the tunnel, a denied host returned 403, and the audit log
+appeared on stdout, which is where the ECS `awslogs` driver picks it up.
 
 ## Development
 
