@@ -1,0 +1,31 @@
+# Linters chosen for what they catch in a network proxy specifically:
+# bodyclose finds a leaked upstream response body, gosec finds a missing
+# ReadHeaderTimeout and loose file permissions, errcheck finds the ignored
+# Close that quietly loses a write error.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - gosec
+    - revive
+    - misspell
+    - bodyclose
+    - noctx
+    - errorlint
+
+issues:
+  exclude-rules:
+    # Test files legitimately ignore errors on teardown paths, build requests
+    # without a context, and read bodies they do not close.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - gosec
+        - noctx
+        - bodyclose

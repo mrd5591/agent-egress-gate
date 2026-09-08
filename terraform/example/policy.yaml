@@ -1,0 +1,33 @@
+# Starter policy for a coding agent in CI.
+#
+# Rules with methods or paths apply to plain HTTP only. A CONNECT tunnel,
+# which is every https:// request, can only be authorised by a host-only rule,
+# because method and path are not visible once TLS starts.
+
+version: 1
+default: deny
+
+rules:
+  # Package registries. Host-only, so HTTPS works.
+  - name: go-modules
+    hosts: ["proxy.golang.org", "sum.golang.org", "storage.googleapis.com"]
+
+  - name: python-packages
+    hosts: ["pypi.org", "*.pypi.org", "files.pythonhosted.org"]
+
+  - name: npm-packages
+    hosts: ["registry.npmjs.org"]
+
+  # Source and API access. Also host-only: a tunnel to github.com cannot be
+  # narrowed to specific repositories from outside the TLS session.
+  - name: github
+    hosts: ["github.com", "api.github.com", "codeload.github.com", "objects.githubusercontent.com"]
+
+  # An example of a rule that constrains method and path. It applies to plain
+  # HTTP only. Pointed at an https:// URL it will refuse, and the audit log
+  # will say why.
+  - name: internal-metadata-readonly
+    hosts: ["metadata.internal"]
+    methods: ["GET"]
+    paths: ["/v1/status"]
+    ports: [80]
