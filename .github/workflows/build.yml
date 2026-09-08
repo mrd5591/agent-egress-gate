@@ -183,9 +183,16 @@ jobs:
       # this the AWS ruleset never loads and the step passes unconditionally.
       # Verified by planting a resource with an invalid instance type: the run
       # was silent without this variable and failed with it.
+      #
+      # GITHUB_TOKEN because `tflint --init` fetches the AWS ruleset from the
+      # GitHub releases API, and an unauthenticated runner shares an IP-based
+      # rate limit with every other runner on its host. Not hypothetical: this
+      # step failed with "403 API rate limit exceeded" on a documentation-only
+      # commit. An authenticated request gets its own, far higher limit.
       - name: tflint
         env:
           TFLINT_CONFIG_FILE: ${{ github.workspace }}/.tflint.hcl
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tflint --init
           tflint --recursive --minimum-failure-severity=error
