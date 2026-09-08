@@ -115,6 +115,16 @@ the chain (the string is hashed as written) but wrong for an evidence log that
 people will sort and diff.
 **Next action:** fixed-width nanoseconds.
 
+### `hours` · small · run 1 — `tflint --init` has no retry and fails on a live GitHub API blip
+The plugin install fetches the AWS ruleset from the GitHub releases API on every
+run, with no retry, so a transient API failure reds the whole `terraform` job on
+a commit that touches no HCL. Seen twice now for different reasons: a `403 API
+rate limit exceeded` (fixed by authenticating with `GITHUB_TOKEN`, commit
+1d4c731) and a `500` on `checksums.txt.sig` during this pass, which passed on a
+plain re-run. Authenticating fixed the rate-limit cause but not the class.
+**Next action:** cache the plugin directory across runs, or wrap `tflint --init`
+in a bounded retry, so a GitHub-side blip does not read as a code failure.
+
 ## Accepted / won't-action
 
 - **A method/path-constrained rule cannot authorise a CONNECT tunnel.** Design
