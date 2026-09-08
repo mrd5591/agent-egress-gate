@@ -1,6 +1,6 @@
 # Build stage. CGO stays off: the binary uses nothing that needs it, and a
 # static binary keeps the runtime image free of a libc to patch.
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 
 WORKDIR /src
 

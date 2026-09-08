@@ -27,9 +27,9 @@ jobs:
         go: ["1.25"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
           check-latest: true
@@ -67,10 +67,22 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+
+      # This Go version tracks the LINTER, not the project. golangci-lint
+      # v2.13.2 requires Go >= 1.26 to build; go.mod still targets 1.25.0 and
+      # the test matrix still runs 1.25, which is what the code is written
+      # against.
+      #
+      # setup-go v5 hid this: it left GOTOOLCHAIN unset, so `go install`
+      # silently downloaded the newer toolchain it needed. v7 sets
+      # GOTOOLCHAIN=local, and the mismatch became a hard failure --
+      # "requires go >= 1.26.0 (running go 1.25.14; GOTOOLCHAIN=local)".
+      # Naming the version is the deterministic fix; re-enabling the implicit
+      # download pins nothing and fails later.
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.25"
+          go-version: "1.26"
 
       # Installed rather than taken from the marketplace action, so the version
       # here is the same one the config was written against and verified with.
@@ -84,8 +96,8 @@ jobs:
   vulncheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
       # Pinned, for the same reason the Terraform provider is pinned: an
@@ -105,9 +117,9 @@ jobs:
   container:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.25"
 
@@ -183,9 +195,9 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.16.1"
           terraform_wrapper: false
@@ -208,7 +220,7 @@ jobs:
           terraform init -backend=false
           terraform validate
 
-      - uses: terraform-linters/setup-tflint@v4
+      - uses: terraform-linters/setup-tflint@v6
         with:
           tflint_version: v0.53.0
 
