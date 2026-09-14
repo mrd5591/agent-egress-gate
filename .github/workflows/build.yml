@@ -243,7 +243,7 @@ jobs:
       # being linted. The key covers the tflint config and the version pinned
       # above, so changing either fetches afresh.
       - name: Cache tflint plugins
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.tflint.d/plugins
           key: tflint-v0.53.0-${{ runner.os }}-${{ hashFiles('.tflint.hcl') }}
